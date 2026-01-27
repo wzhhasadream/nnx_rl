@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Experiment outputs / logs
+Results/
+wandb/
+*.log
+
+# Common ML artifacts
+*.ckpt
+*.pt
+*.pth
+*.npz
+*.npy
+*.pkl
+
+# OS files
+.DS_Store
+
+# Local scratch notebook in this repo
+test.ipynb
