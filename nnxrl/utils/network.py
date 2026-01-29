@@ -16,8 +16,7 @@ class MLP(nnx.Module):
         hidden_dims: list[int],
         rngs: nnx.Rngs,
         layer_norm: bool = False,
-        activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.relu,
-        orthogonal_init: bool = True
+        activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.relu
     ):
         dims = [in_dim] + list(hidden_dims)
 
@@ -25,7 +24,7 @@ class MLP(nnx.Module):
             nnx.Linear(
                 dims[i], dims[i + 1],
                 rngs=rngs,
-                kernel_init=orthogonal() if orthogonal_init else nnx.initializers.lecun_normal()
+                kernel_init=orthogonal() 
             )
             for i in range(len(hidden_dims))
         ]

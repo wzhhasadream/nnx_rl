@@ -58,12 +58,12 @@ class ActorCritic(nnx.Module):
             self.critic_obs_dim = int(obs_dim)
 
         # Critic network.
-        self.critic_encoder = MLP(self.critic_obs_dim, list(self.hidden_dim), rngs=rngs, activation_fn=activation_fn, orthogonal_init=True)
+        self.critic_encoder = MLP(self.critic_obs_dim, list(self.hidden_dim), rngs=rngs, activation_fn=activation_fn)
         self.critic_head = nnx.Linear(
             self.hidden_dim[-1], 1, rngs=rngs, kernel_init=orthogonal())
 
         # Actor network.
-        self.actor_encoder = MLP(self.actor_obs_dim, list(self.hidden_dim), rngs=rngs, activation_fn=activation_fn, orthogonal_init=True)
+        self.actor_encoder = MLP(self.actor_obs_dim, list(self.hidden_dim), rngs=rngs, activation_fn=activation_fn)
         self.mean_head = nnx.Linear(self.hidden_dim[-1], action_dim, rngs=rngs, kernel_init=orthogonal())
         self.log_std = nnx.Param(jnp.zeros((action_dim,)))
 
