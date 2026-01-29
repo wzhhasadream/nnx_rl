@@ -112,7 +112,7 @@ def main():
     actor_opt = nnx.Optimizer(actor, optax.adamw(
         args.policy_lr, weight_decay=1e-2)) if args.simba else nnx.Optimizer(actor, optax.adam(args.policy_lr))
     critic_opt = nnx.Optimizer(critic, optax.adamw(
-        args.q_lr, weight_decay=1e-2)) if args.simba else nnx.Optimizer(actor, optax.adam(args.q_lr))
+        args.q_lr, weight_decay=1e-2)) if args.simba else nnx.Optimizer(critic, optax.adam(args.q_lr))
 
     buffer_state = init_replay_buffer(
         envs.single_observation_space.shape,
@@ -157,7 +157,7 @@ def main():
         else:
             rms, actions = jit_get_action(
                 train_state.actor, train_state.rms, obs, jax.random.fold_in(step_key, global_step))
-            train_state.replace(rms=rms)
+            train_state = train_state.replace(rms=rms)
             actions = np.asarray(actions)
 
         next_obs, rewards, terminations, truncations, infos = envs.step(
