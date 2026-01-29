@@ -57,9 +57,9 @@ class Actor(nnx.Module):
             self.encoder = MLP(self.actor_obs_dim, hidden_dim, rngs, layer_norm,
                            activation_fn=activation_fn)
             out_dim = hidden_dim[-1]
-        self.fc_mean = nnx.Linear(out_dim, action_dim, rngs=rngs, kernel_init=orthogonal(1))
+        self.fc_mean = nnx.Linear(out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
         self.fc_logstd = nnx.Linear(
-            out_dim, action_dim, rngs=rngs, kernel_init=orthogonal(1))
+            out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
 
 
     def __call__(self, x: Any) -> Any:

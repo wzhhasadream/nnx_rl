@@ -88,7 +88,7 @@ class QNetwork(nnx.Module):
                            rngs=rngs, layer_norm=layer_norm, activation_fn=activation_fn)
             out_dim = hidden_dim[-1]
         self.out = nnx.Linear(
-            out_dim, 1, rngs=rngs, kernel_init=orthogonal(1))
+            out_dim, 1, rngs=rngs, kernel_init=orthogonal())
 
     def __call__(self, x, a):
         _, obs_for_critic = split_observation(x)
