@@ -17,7 +17,7 @@ class MLP(nnx.Module):
         rngs: nnx.Rngs,
         layer_norm: bool = False,
         activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.relu,
-        orthogonal_init: bool = False
+        orthogonal_init: bool = True
     ):
         dims = [in_dim] + list(hidden_dims)
 
@@ -88,7 +88,7 @@ class QNetwork(nnx.Module):
                            rngs=rngs, layer_norm=layer_norm, activation_fn=activation_fn)
             out_dim = hidden_dim[-1]
         self.out = nnx.Linear(
-            out_dim, 1, rngs=rngs)
+            out_dim, 1, rngs=rngs, kernel_init=orthogonal(1))
 
     def __call__(self, x, a):
         _, obs_for_critic = split_observation(x)

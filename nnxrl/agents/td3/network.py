@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from typing import Callable
-from ...utils.network import MLP, flattened_dim, SimBaEncoder
+from ...utils.network import MLP, flattened_dim, SimBaEncoder, orthogonal
 from ...utils.policy import TanhDeterministicPolicy, split_observation
 ########################
 # Actor Network
@@ -55,7 +55,7 @@ class Actor(nnx.Module):
                            hidden_dim, rngs, layer_norm, activation_fn=activation_fn)
             out_dim = hidden_dim[-1]
         self.actor_head = nnx.Linear(
-            out_dim, action_dim, rngs=rngs)
+            out_dim, action_dim, rngs=rngs, kernel_init=orthogonal(1))
 
 
 
