@@ -41,3 +41,4 @@ wandb/
 
 # Local scratch notebook in this repo
 test.ipynb
+exp.sh
