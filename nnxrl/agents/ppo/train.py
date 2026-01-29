@@ -10,7 +10,7 @@ from ...utils.normalization import RMSState, rms_normalize, rms_update
 from ...utils.evaluate import evaluate_policy
 
 if TYPE_CHECKING:
-    from srcipts.ppo_playground import Args as PPOArgs
+    from scr.ppo_playground import Args as PPOArgs
 
     PPOConfig: TypeAlias = PPOArgs
 else:
