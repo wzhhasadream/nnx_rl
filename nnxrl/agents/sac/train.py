@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from flax import nnx
 import flax.struct as struct
 from mujoco_playground import MjxEnv
-from typing import Any, Callable
+from typing import Callable, Protocol
 from .network import Actor, Alpha
 from ...utils.network import DoubleCritic, soft_update
 from ...utils.replaybuffer import Batch, sample, add, ReplayBufferState
@@ -13,7 +13,28 @@ from ...utils.normalization import RMSState, rms_normalize, rms_update
 from ...utils.evaluate import evaluate_policy
 
 
-SACConfig = Any
+class SACConfig(Protocol):
+    # This protocol describes the minimal config interface required by SAC training code.
+    # Any object with these attributes (e.g., a dataclass from a script) can be used.
+    seed: int
+    total_timesteps: int
+    num_envs: int
+    learning_starts: int
+    num_evals: int
+
+    gamma: float
+    tau: float
+
+    batch_size: int
+    grad_step_per_env_step: int
+    policy_frequency: int
+    target_frequency: int
+
+    normalize_observation: bool
+
+    autotune: bool
+    alpha: float
+    target_entropy: float
 
 @struct.dataclass
 class TrainState:

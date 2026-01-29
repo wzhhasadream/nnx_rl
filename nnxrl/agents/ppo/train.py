@@ -3,18 +3,39 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 from flax import nnx, struct
-from typing import Callable, NamedTuple, TYPE_CHECKING, TypeAlias
+from typing import Callable, NamedTuple, Protocol
 from .network import ActorCritic
 from mujoco_playground._src import mjx_env
-from ...utils.normalization import RMSState, rms_normalize, rms_update
+from ...utils.normalization import RMSState, rms_normalize
 from ...utils.evaluate import evaluate_policy
 
-if TYPE_CHECKING:
-    from scr.ppo_playground import Args as PPOArgs
+class PPOConfig(Protocol):
+    # This protocol describes the minimal config interface required by PPO training code.
+    # Any object with these attributes (e.g., a dataclass from a script) can be used.
+    seed: int
+    total_timesteps: int
+    num_envs: int
+    rollout_steps: int
 
-    PPOConfig: TypeAlias = PPOArgs
-else:
-    PPOConfig = object
+    gamma: float
+    gae_lambda: float
+    reward_scale: float
+
+    clip_coef: float
+    entropy_coef: float
+    value_coef: float
+    lr: float
+    max_grad_norm: float | None
+
+    normalize_observation: bool
+    normalize_advantage: bool
+    clip_value: bool
+    target_kl: float | None
+
+    num_minibatches: int
+    update_epochs: int
+    num_evals: int
+    eval_step: int
 
 
 @struct.dataclass

@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple, Callable
+from typing import Dict, Tuple, Callable, Protocol
 import jax
 import jax.numpy as jnp
-from dataclasses import dataclass
 from flax import nnx, struct
 from ...utils.normalization import RMSState, rms_normalize, rms_update
 from ...utils.replaybuffer import Batch, ReplayBufferState, add, sample
@@ -13,7 +12,30 @@ from mujoco_playground import MjxEnv, State
 from ...utils.evaluate import evaluate_policy
 
 
-TD3Config = Any
+class TD3Config(Protocol):
+    # This protocol describes the minimal config interface required by TD3 training code.
+    # Any object with these attributes (e.g., a dataclass from a script) can be used.
+    seed: int
+    total_timesteps: int
+    num_envs: int
+    learning_starts: int
+    num_evals: int
+
+    gamma: float
+    tau: float
+
+    batch_size: int
+    grad_step_per_env_step: int
+    policy_frequency: int
+
+    policy_lr: float
+    actor_noise: float | None
+
+    normalize_observation: bool
+    exploration_noise: float
+
+    policy_noise: float
+    noise_clip: float
 
 @struct.dataclass
 class TrainState:
@@ -246,7 +268,7 @@ def sample_and_update_td3(
 
     
 
-def env_step(train_state: TrainState, config: dataclass, state: State, envs: MjxEnv, step_idx: jax.Array, key: jax.Array):
+def env_step(train_state: TrainState, config: TD3Config, state: State, envs: MjxEnv, step_idx: jax.Array, key: jax.Array):
     if config.normalize_observation and train_state.rms is not None:
         obs_for_policy, new_rms = rms_normalize(state.obs, train_state.rms)
         train_state = train_state.replace(rms=new_rms)
@@ -298,7 +320,7 @@ def env_step(train_state: TrainState, config: dataclass, state: State, envs: Mjx
 
 def make_train(
     envs: MjxEnv,
-    config: dataclass,
+    config: TD3Config,
     train_log_fn: Callable,
 ):
     def train(train_state: TrainState):
