@@ -276,13 +276,13 @@ def env_step(train_state: TrainState, config: TD3Config, state: State, envs: Mjx
         obs_for_policy = state.obs
 
     def _action_with_exploration_noise(ts: TrainState):
-        
+        actions = ts.actor.get_action(obs_for_policy)
         noise = (
-            jax.random.normal(key, shape=(config.num_envs, 1))
+            jax.random.normal(key, shape=actions.shape)
             * config.exploration_noise
             * ts.actor.action_scale
         )
-        actions = ts.actor.get_action(obs_for_policy)
+        
         return jnp.clip(noise + actions, min=ts.actor.action_low, max=ts.actor.action_high)
 
     actions = nnx.cond(
