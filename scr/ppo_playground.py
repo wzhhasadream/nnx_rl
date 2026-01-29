@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+import jax
 from nnxrl.agents.ppo.train import TrainState, make_train
 from nnxrl.utils.normalization import rms_init
 from nnxrl.utils.brax_wrapper import wrap_for_training
@@ -61,6 +62,9 @@ def main():
         raise ValueError(
             f"num_rollout ({num_rollout}) must be >= num_evals ({args.num_evals}) "
         )
+
+    activation_fn = jax.nn.mish
+
     steps_per_rollout = args.num_minibatches * args.update_epochs
     wandb.init(project='ppo', config=vars(args), name=f'{args.env_id}')
     start_time = time.time()
@@ -83,7 +87,7 @@ def main():
         reward_gamma=args.gamma
     )
     agent = ActorCritic(env.observation_size, env.action_size, nnx.Rngs(
-        args.seed), hidden_dim=args.hidden_dim)
+        args.seed), hidden_dim=args.hidden_dim, activation_fn=activation_fn)
 
     def lr_schedule(step):
         progress = (step // steps_per_rollout) / max(num_rollout, 1)
