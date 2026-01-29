@@ -58,12 +58,12 @@ class ActorCritic(nnx.Module):
             self.critic_obs_dim = int(obs_dim)
 
         # Critic network.
-        self.critic_encoder = MLP(self.critic_obs_dim, list(self.hidden_dim), rngs=rngs, activation_fn=activation_fn)
+        self.critic_encoder = MLP(self.critic_obs_dim, list(self.hidden_dim), rngs=rngs, activation_fn=activation_fn, orthogonal_init=True)
         self.critic_head = nnx.Linear(
             self.hidden_dim[-1], 1, rngs=rngs, kernel_init=orthogonal())
 
         # Actor network.
-        self.actor_encoder = MLP(self.actor_obs_dim, list(self.hidden_dim), rngs=rngs, activation_fn=activation_fn)
+        self.actor_encoder = MLP(self.actor_obs_dim, list(self.hidden_dim), rngs=rngs, activation_fn=activation_fn, orthogonal_init=True)
         self.mean_head = nnx.Linear(self.hidden_dim[-1], action_dim, rngs=rngs, kernel_init=orthogonal())
         self.log_std = nnx.Param(jnp.zeros((action_dim,)))
 
@@ -131,7 +131,7 @@ class CategoricalActorCritic(nnx.Module):
 
 
         # Shared trunk.
-        self.encoder = MLP(h * w * c, hidden_dim, rngs)
+        self.encoder = MLP(h * w * c, hidden_dim, rngs, orthogonal_init=True)
 
         # Actor head.
         self.actor_head = nnx.Linear(hidden_dim[-1], self.num_action, rngs=rngs, kernel_init=orthogonal())

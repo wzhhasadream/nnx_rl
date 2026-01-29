@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from typing import Any, Callable
-from ...utils.network import MLP, orthogonal, SimBaEncoder
+from ...utils.network import MLP, SimBaEncoder
 from ...utils.policy import SquashedTanhGaussianPolicy, flattened_dim, split_observation
 
 
@@ -57,9 +57,9 @@ class Actor(nnx.Module):
             self.encoder = MLP(self.actor_obs_dim, hidden_dim, rngs, layer_norm,
                            activation_fn=activation_fn)
             out_dim = hidden_dim[-1]
-        self.fc_mean = nnx.Linear(out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
+        self.fc_mean = nnx.Linear(out_dim, action_dim, rngs=rngs)
         self.fc_logstd = nnx.Linear(
-            out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
+            out_dim, action_dim, rngs=rngs)
 
 
     def __call__(self, x: Any) -> Any:

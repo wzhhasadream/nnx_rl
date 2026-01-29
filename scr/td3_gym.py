@@ -136,8 +136,7 @@ def main():
         else:
             obs_for_policy = obs
         actions = actor.get_action(obs_for_policy)
-        noise = jax.random.normal(key, shape=(
-            args.num_envs, 1)) * train_state.actor.action_scale * args.exploration_noise
+        noise = jax.random.normal(key, shape=actions.shape) * train_state.actor.action_scale * args.exploration_noise
         actions = jnp.clip(
             noise + actions, envs.single_action_space.low,  envs.single_action_space.high)
         return rms, actions
