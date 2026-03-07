@@ -190,16 +190,17 @@ def update_td3(
     """(multiple SGD steps per env step)."""
 
     if train_state.rms is not None and config.normalize_observation:
-        rms = rms_update(train_state.rms, big_batch.observations)
-        rms = rms_update(rms, big_batch.next_observations)
-        obs_for_policy, _ = rms_normalize(
-            big_batch.observations, rms, update=False)
-        next_obs_for_policy, _ = rms_normalize(
-            big_batch.next_observations, rms, update=False)
+        stacked_obs = jnp.concatenate(
+            [big_batch.observations, big_batch.next_observations],
+            axis=0,
+        )
+        normalized_obs, rms = rms_normalize(stacked_obs, train_state.rms, update=True)
         train_state = train_state.replace(rms=rms)
+
+        batch_size = big_batch.observations.shape[0]
         big_batch = big_batch._replace(
-            observations=obs_for_policy,
-            next_observations=next_obs_for_policy,
+            observations=normalized_obs[:batch_size],
+            next_observations=normalized_obs[batch_size:],
         )
 
     batches = jax.tree.map(
