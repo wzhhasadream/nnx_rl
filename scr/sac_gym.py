@@ -1,4 +1,5 @@
 
+from re import split
 import nnxrl.utils.logger as wandb
 from flax import nnx
 from nnxrl.utils.replaybuffer import init_replay_buffer, add
@@ -36,6 +37,7 @@ class Args:
     autotune: Literal[True, False] = True
     target_entropy: float = 0  # will be set automatically
     hidden_dim: Sequence[int] = (256, 256)
+    num_q: int = 2
 
     # Automatically set for DMC environments, can be overridden manually
     action_repeat: int = 2
@@ -112,7 +114,7 @@ def main():
     critic = DoubleCritic(
         obs_dim,
         action_dim,
-        rngs.fork(),
+        rngs.fork(split=args.num_q),
         hidden_dim=args.hidden_dim,
         activation_fn=activation_fn,
         simba_encoder=args.simba

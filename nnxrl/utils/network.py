@@ -98,7 +98,7 @@ class QNetwork(nnx.Module):
 
 class DoubleCritic(nnx.Module):
     """Double Q network using NNX API."""
-
+    @nnx.vmap(in_axes=(0, None, None, 0, None, None, None, None))
     def __init__(
         self, obs_dim,
         action_dim, rngs,
@@ -107,18 +107,14 @@ class DoubleCritic(nnx.Module):
         layer_norm: bool = False,
         simba_encoder: bool = False
     ):
-        critic1_rngs = rngs.fork()
-        critic2_rngs = rngs.fork()
 
-        self.critic1 = QNetwork(
-            obs_dim, action_dim, critic1_rngs, hidden_dim, activation_fn, layer_norm, simba_encoder)
-        self.critic2 = QNetwork(
-            obs_dim, action_dim, critic2_rngs, hidden_dim, activation_fn, layer_norm, simba_encoder)
+        self.critic = QNetwork(
+            obs_dim, action_dim, rngs, hidden_dim, activation_fn, layer_norm, simba_encoder)
 
+    @nnx.vmap(in_axes=(0, None, None), out_axes=(1))
     def __call__(self, observations: Any, actions: jax.Array) -> jax.Array:
-        q1 = self.critic1(observations, actions)
-        q2 = self.critic2(observations, actions)
-        return jnp.minimum(q1, q2)
+        q = self.critic(observations, actions)
+        return q    # (B, num_q, 1)
 
 
 def copy_model(copied_model: nnx.Module) -> nnx.Module:

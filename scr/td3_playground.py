@@ -33,6 +33,7 @@ class Args:
     noise_clip: float = 0.5
     exploration_noise: float = 0.5
     hidden_dim: Sequence[int] = (512, 256, 128)
+    num_q: int = 2
 
 
 
@@ -62,7 +63,7 @@ def main():
 
     rngs = nnx.Rngs(args.seed)
     actor = Actor(env.observation_size, env.action_size, rngs.fork())
-    critic = DoubleCritic(env.observation_size, env.action_size, rngs.fork(), hidden_dim=args.hidden_dim, layer_norm=True)
+    critic = DoubleCritic(env.observation_size, env.action_size, rngs.fork(split=args.num_q), hidden_dim=args.hidden_dim, layer_norm=True)
     target_actor = copy_model(actor)
     target_critic = copy_model(critic)
 

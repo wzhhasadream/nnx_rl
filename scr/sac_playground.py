@@ -1,4 +1,5 @@
 import dataclasses
+from re import split
 from typing import Sequence, Literal
 import tyro
 import optax
@@ -35,6 +36,7 @@ class Args:
     num_evals: int = 10
     target_entropy: float = 0  # will be set automatically
     hidden_dim: Sequence = (256, 256)
+    num_q: int = 2
 
 
 
@@ -64,8 +66,7 @@ def main():
 
     rngs = nnx.Rngs(args.seed)
     actor = Actor(env.observation_size, env.action_size, rngs.fork(), simba_encoder=True)
-    critic = DoubleCritic(env.observation_size, env.action_size, rngs.fork(
-    ), hidden_dim=args.hidden_dim, simba_encoder=True)
+    critic = DoubleCritic(env.observation_size, env.action_size, rngs.fork(split=args.num_q), hidden_dim=args.hidden_dim, simba_encoder=True)
     target_critic = copy_model(critic)
     alpha = Alpha() if args.autotune else None
     actor_opt = nnx.Optimizer(actor, optax.adam(args.policy_lr))

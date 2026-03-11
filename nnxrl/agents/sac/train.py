@@ -52,45 +52,31 @@ class TrainState:
     alpha_opt: nnx.Optimizer | None = None
 
 
-
-
-def update_critic(
-    train_state: TrainState,
-    config: SACConfig,
-    batch: Batch,
-    key: jax.Array,
-) -> tuple[TrainState, dict[str, jax.Array]]:
-    """Update critic parameters and return the updated TrainState."""
+def update_critic(train_state: TrainState, config: SACConfig, batch: Batch, key: jax.Array):
+    next_actions, next_log_pi = train_state.actor.get_action(
+        batch.next_observations, key)
+    next_q = train_state.target_critic(batch.next_observations, next_actions)
+    min_next_q = jnp.min(next_q, axis=1)
+    alpha_value = train_state.alpha() if config.autotune else config.alpha
+    target_q = batch.rewards + (1.0 - batch.dones) * config.gamma * (
+        min_next_q - alpha_value * next_log_pi
+    )
+    target_q = jax.lax.stop_gradient(target_q)[:, None, :]
 
     def critic_loss_fn(critic_model: DoubleCritic):
-        # Target: r + gamma * (min(Q') - alpha * log pi(a'|s'))
-        next_actions, next_log_pi = train_state.actor.get_action(batch.next_observations, key)
-        min_next_q = train_state.target_critic(batch.next_observations, next_actions)
-
-        alpha_value = train_state.alpha() if config.autotune else config.alpha
-        target_q = batch.rewards + (1.0 - batch.dones) * config.gamma * (
-            min_next_q - alpha_value * next_log_pi
-        )
-        target_q = jax.lax.stop_gradient(target_q)
-
-        q1 = critic_model.critic1(batch.observations, batch.actions)
-        q2 = critic_model.critic2(batch.observations, batch.actions)
-
-        q1_loss = jnp.mean((q1 - target_q) ** 2)
-        q2_loss = jnp.mean((q2 - target_q) ** 2)
-        critic_loss = q1_loss + q2_loss
-
+        q = critic_model(batch.observations, batch.actions)
+        critic_loss = jnp.mean((q - target_q) ** 2)
         info = {
-            "training/q1_mean": jnp.mean(q1),
-            "training/q2_mean": jnp.mean(q2),
-            "training/q1_loss": q1_loss,
-            "training/q2_loss": q2_loss,
+            "training/q_loss": critic_loss,
+            "training/q_mean": jnp.mean(q),
         }
         return critic_loss, info
 
-    (_loss, info), grads = nnx.value_and_grad(critic_loss_fn, has_aux=True)(train_state.critic)
+    (_loss, info), grads = nnx.value_and_grad(
+        critic_loss_fn, has_aux=True)(train_state.critic)
     train_state.critic_opt.update(grads)
     return train_state, info
+
 
 
 def update_actor(
@@ -100,15 +86,19 @@ def update_actor(
     key: jax.Array,
 ) -> tuple[TrainState, dict[str, jax.Array]]:
     """Update actor parameters and return the updated TrainState."""
+    alpha_value = train_state.alpha() if config.autotune else config.alpha
+    alpha_value = jax.lax.stop_gradient(alpha_value)
 
-    def actor_loss_fn(actor_model: Actor):
+    def actor_loss_fn(actor_model: Actor, critic_model: DoubleCritic):
         actions, log_pi = actor_model.get_action(batch.observations, key)
-        min_q = train_state.critic(batch.observations, actions)
-        alpha_value = train_state.alpha() if config.autotune else config.alpha
+        q = critic_model(batch.observations, actions)
+        min_q = jnp.min(q, axis=1)
         actor_loss = -jnp.mean(min_q - alpha_value * log_pi)
         return actor_loss, {"training/actor_loss": actor_loss}
 
-    (_loss, info), grads = nnx.value_and_grad(actor_loss_fn, has_aux=True)(train_state.actor)
+    (_loss, info), grads = nnx.value_and_grad(
+        actor_loss_fn, argnums=0, has_aux=True
+    )(train_state.actor, train_state.critic)
     train_state.actor_opt.update(grads)
     return train_state, info
 
@@ -120,9 +110,10 @@ def update_alpha(
     key: jax.Array,
 ) -> tuple[TrainState, dict[str, jax.Array]]:
     """Update entropy temperature (alpha) and return the updated TrainState."""
+    _, log_pi = train_state.actor.get_action(batch.observations, key)
+    log_pi = jax.lax.stop_gradient(log_pi)
 
     def alpha_loss_fn(alpha_model: Alpha):
-        _, log_pi = train_state.actor.get_action(batch.observations, key)
         alpha_loss = (-alpha_model() * (log_pi + config.target_entropy)).mean()
         return alpha_loss, {"training/alpha_loss": alpha_loss, "training/alpha_value": alpha_model()}
 

@@ -1,3 +1,4 @@
+from re import split
 import nnxrl.utils.logger as wandb
 from flax import nnx
 from typing import Literal, Sequence
@@ -19,7 +20,7 @@ import dataclasses
 
 @dataclasses.dataclass
 class Args:
-    env_id: str = "humanoid-run"
+    env_id: str = "Ant-v4"
     seed: int = 0
     num_envs: int = 1
     total_timesteps: int = int(1e6)
@@ -32,10 +33,10 @@ class Args:
     policy_lr: float = 3e-4
     q_lr: float = 3e-4
     policy_noise: float = 0.2
-    actor_noise: float | None = None
     noise_clip: float = 0.5
     exploration_noise: float = 0.1
     hidden_dim: Sequence[int] = (256, 256)
+    num_q: int = 2
 
     # Automatically set for DMC environments, can be overridden manually
     action_repeat: int = 2
@@ -106,7 +107,8 @@ def main():
     target_actor = copy_model(actor)
 
     critic = DoubleCritic(
-        obs_dim, action_dim, rngs.fork(), hidden_dim=args.hidden_dim, activation_fn=activation_fn, simba_encoder=args.simba)
+        obs_dim, action_dim, rngs.fork(split=args.num_q), hidden_dim=args.hidden_dim, activation_fn=activation_fn, simba_encoder=args.simba)
+
     target_critic = copy_model(critic)
 
     actor_opt = nnx.Optimizer(actor, optax.adamw(

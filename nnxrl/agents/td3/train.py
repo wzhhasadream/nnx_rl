@@ -107,36 +107,32 @@ def update_critic(
 ) -> Tuple[TrainState, Dict[str, jax.Array]]:
     """Update TD3 critics and return the updated TrainState."""
 
-    def critic_loss_fn(critic_model: DoubleCritic):
+    def critic_loss_fn(critic: DoubleCritic, target_critic: DoubleCritic, actor: Actor):
         target_key, _ = jax.random.split(key)
         smoothed_actions = _target_policy_smoothing(
-            train_state.target_actor,
+            actor,
             batch.next_observations,
             key=target_key,
             policy_noise=config.policy_noise,
             noise_clip=config.noise_clip,
         )
 
-        target_q = train_state.target_critic(batch.next_observations, smoothed_actions)
-        target_values = batch.rewards + config.gamma * (1.0 - batch.dones) * target_q
-        target_values = jax.lax.stop_gradient(target_values)
+        target_q = target_critic(batch.next_observations, smoothed_actions)
+        min_q = jnp.min(target_q, axis=1)
+        target_values = batch.rewards + \
+            config.gamma * (1.0 - batch.dones) * min_q
+        target_values = jax.lax.stop_gradient(target_values)[:, None, :]
 
-        q1, q2 = critic_model.critic1(batch.observations, batch.actions), critic_model.critic2(batch.observations, batch.actions)
-        q1_loss = jnp.mean((q1 - target_values) ** 2)
-        q2_loss = jnp.mean((q2 - target_values) ** 2)
-        total_loss = q1_loss + q2_loss
+        q = critic(batch.observations, batch.actions)
+        q_loss = jnp.mean((q - target_values) ** 2)
 
         info = {
-            "training/critic_loss": total_loss,
-            "training/q1_loss": q1_loss,
-            "training/q2_loss": q2_loss,
-            "training/q1_mean": jnp.mean(q1),
-            "training/q2_mean": jnp.mean(q2),
-            "training/target_q_mean": jnp.mean(target_q),
+            "training/critic_loss": q_loss,
+            "training/q_mean": jnp.mean(q),
         }
-        return total_loss, info
+        return q_loss, info
 
-    (_loss, info), grads = nnx.value_and_grad(critic_loss_fn, has_aux=True)(train_state.critic)
+    (_loss, info), grads = nnx.value_and_grad(critic_loss_fn, has_aux=True, argnums=0)(train_state.critic, train_state.target_critic, train_state.actor)
     train_state.critic_opt.update(grads)
     return train_state, info
 
@@ -147,27 +143,16 @@ def update_critic(
 def update_actor(
     train_state: TrainState,
     batch: Batch,
-    *,
-    key: jax.Array,
-    actor_noise: float | None = None,
-    lr: float | None = None
 ) -> Tuple[TrainState, Dict[str, jax.Array]]:
     """Update TD3 actor and return the updated TrainState.
-
-    If `actor_noise` is provided (>0), adds Gaussian noise to the actor gradients
-    (a.k.a. gradient noise) before applying the optimizer update.
     """
-    def actor_loss_fn(actor_model: Actor):
-        actions = actor_model.get_action(batch.observations)
-        q = train_state.critic.critic1(batch.observations, actions)
+    def actor_loss_fn(actor: Actor, critic: DoubleCritic):
+        actions = actor.get_action(batch.observations)
+        q = critic(batch.observations, actions)[:, 0, :]
         actor_loss = -jnp.mean(q)
         return actor_loss, {"training/actor_loss": actor_loss}
 
-    (_loss, info), grads = nnx.value_and_grad(actor_loss_fn, has_aux=True)(train_state.actor)
-    if actor_noise is not None and float(actor_noise) > 0.0:
-        noise_std = float(actor_noise)
-        noise_std = noise_std * (float(lr) ** 0.5)
-        grads = _add_gaussian_noise_to_grads(grads, key=key, std=noise_std)
+    (_loss, info), grads = nnx.value_and_grad(actor_loss_fn, has_aux=True, argnums=0)(train_state.actor, train_state.critic)
     train_state.actor_opt.update(grads)
 
     return train_state, info
@@ -212,8 +197,7 @@ def update_td3(
     update_keys = jax.random.split(key, config.grad_step_per_env_step)
     @nnx.scan(in_axes=(nnx.Carry, 0, 0), out_axes=(nnx.Carry, 0))
     def update_td3_mininbatch(train_state, batch, key):
-        critic_key, actor_key = jax.random.split(key, 2)
-        train_state, critic_info = update_critic(train_state, config, batch, critic_key)
+        train_state, critic_info = update_critic(train_state, config, batch, key)
         train_state = train_state.replace(grad_updates=train_state.grad_updates + 1)
 
         zero = jnp.array(0.0, dtype=jnp.float32)
@@ -222,10 +206,7 @@ def update_td3(
         def _do_policy_update(ts: TrainState):
             ts, actor_info = update_actor(
                 ts,
-                batch,
-                key=actor_key,
-                actor_noise=config.actor_noise,
-                lr = config.policy_lr
+                batch
             )
             ts = update_targets(ts, config.tau)
             return ts, actor_info
