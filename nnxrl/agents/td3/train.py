@@ -106,23 +106,20 @@ def update_critic(
     key: jax.Array,
 ) -> Tuple[TrainState, Dict[str, jax.Array]]:
     """Update TD3 critics and return the updated TrainState."""
+    target_key, _ = jax.random.split(key)
+    smoothed_actions = _target_policy_smoothing(
+        train_state.target_actor,
+        batch.next_observations,
+        key=target_key,
+        policy_noise=config.policy_noise,
+        noise_clip=config.noise_clip,
+    )
+    target_q = train_state.target_critic(batch.next_observations, smoothed_actions)
+    min_q = jnp.min(target_q, axis=1)
+    target_values = batch.rewards + config.gamma * (1.0 - batch.dones) * min_q
+    target_values = jax.lax.stop_gradient(target_values)[:, None, :]
 
-    def critic_loss_fn(critic: DoubleCritic, target_critic: DoubleCritic, actor: Actor):
-        target_key, _ = jax.random.split(key)
-        smoothed_actions = _target_policy_smoothing(
-            actor,
-            batch.next_observations,
-            key=target_key,
-            policy_noise=config.policy_noise,
-            noise_clip=config.noise_clip,
-        )
-
-        target_q = target_critic(batch.next_observations, smoothed_actions)
-        min_q = jnp.min(target_q, axis=1)
-        target_values = batch.rewards + \
-            config.gamma * (1.0 - batch.dones) * min_q
-        target_values = jax.lax.stop_gradient(target_values)[:, None, :]
-
+    def critic_loss_fn(critic: DoubleCritic):
         q = critic(batch.observations, batch.actions)
         q_loss = jnp.mean((q - target_values) ** 2)
 
@@ -132,7 +129,9 @@ def update_critic(
         }
         return q_loss, info
 
-    (_loss, info), grads = nnx.value_and_grad(critic_loss_fn, has_aux=True, argnums=0)(train_state.critic, train_state.target_critic, train_state.actor)
+    (_loss, info), grads = nnx.value_and_grad(
+        critic_loss_fn, has_aux=True
+    )(train_state.critic)
     train_state.critic_opt.update(grads)
     return train_state, info
 
