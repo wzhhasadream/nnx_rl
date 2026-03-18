@@ -100,8 +100,10 @@ class DoubleCritic(nnx.Module):
     """Double Q network using NNX API."""
     @nnx.vmap(in_axes=(0, None, None, 0, None, None, None, None))
     def __init__(
-        self, obs_dim,
-        action_dim, rngs,
+        self, 
+        obs_dim: int,
+        action_dim: int,
+        rngs: nnx.Rngs,
         hidden_dim=(256, 256),
         activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.relu,
         layer_norm: bool = False,
