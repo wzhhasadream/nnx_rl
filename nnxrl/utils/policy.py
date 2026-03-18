@@ -100,6 +100,25 @@ def squash_log_std_tanh(log_std: jax.Array, *, log_std_min: float, log_std_max: 
     return log_std_min + 0.5 * (log_std_max - log_std_min) * (log_std + 1.0)
 
 
+def squash_tanh_action(pre_action: jax.Array, pre_log_prob: jax.Array, action_low: jax.Array, action_high: jax.Array):
+    """Apply tanh squashing with affine action scaling and corrected log-prob."""
+    scale, bias = action_scale_bias(action_low, action_high)
+    action = scale * jax.nn.tanh(pre_action) + bias
+    logdet_tanh = jnp.sum(
+        2.0 * (jnp.log(2.0) - pre_action - jax.nn.softplus(-2.0 * pre_action)),
+        axis=-1,
+    )
+    log_scale = jnp.log(jnp.abs(scale))
+    if jnp.ndim(log_scale) == 0:
+        logdet_affine = pre_action.shape[-1] * log_scale
+    else:
+        logdet_affine = jnp.sum(log_scale, axis=-1)
+    log_prob = pre_log_prob - logdet_tanh - logdet_affine
+    if getattr(pre_log_prob, "ndim", None) == 2:
+        log_prob = log_prob[:, None]
+    return action, log_prob
+
+    
 def mask_logits(
     logits: jax.Array,
     legal_action_mask: Optional[jax.Array],
