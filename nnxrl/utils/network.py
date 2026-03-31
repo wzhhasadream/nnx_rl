@@ -14,12 +14,13 @@ from .policy import (
 
 class QNetwork(nnx.Module):
     def __init__(self, obs_dim: int | tuple[int, ...],
-                 action_dim: int,
-                 rngs: nnx.Rngs,
-                 hidden_dim=(256, 256),
-                 activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
-                 layer_norm: bool = False,
-                 simba_encoder: bool = False
+                action_dim: int,
+                rngs: nnx.Rngs,
+                hidden_dim=(256, 256),
+                activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
+                layer_norm: bool = False,
+                simba_encoder: bool = False,
+                n_head: int = 1     # for distributional q
                  ):
         self.obs_dim = flattened_dim(obs_dim)
         if simba_encoder:
@@ -31,7 +32,7 @@ class QNetwork(nnx.Module):
                            rngs=rngs, layer_norm=layer_norm, activation_fn=activation_fn)
             out_dim = hidden_dim[-1]
         self.out = nnx.Linear(
-            out_dim, 1, rngs=rngs, kernel_init=orthogonal())
+            out_dim, n_head, rngs=rngs, kernel_init=orthogonal())
 
     def __call__(self, x, a):
         h = jnp.concatenate([x, a], axis=1)
@@ -67,7 +68,7 @@ class VNetwork(nnx.Module):
 
 class EnsembleCritic(nnx.Module):
     """Ensemble Q network using NNX API."""
-    @nnx.vmap(in_axes=(0, None, None, 0, None, None, None, None))
+    @nnx.vmap(in_axes=(0, None, None, 0, None, None, None, None, None))
     def __init__(
         self,
         obs_dim: int,
@@ -76,16 +77,17 @@ class EnsembleCritic(nnx.Module):
         hidden_dim: Sequence[int] = (256, 256),
         activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
         layer_norm: bool = False,
-        simba_encoder: bool = False
+        simba_encoder: bool = False,
+        n_head: int = 1
     ):
 
         self.critic = QNetwork(
-            obs_dim, action_dim, rngs, hidden_dim, activation_fn, layer_norm, simba_encoder)
+            obs_dim, action_dim, rngs, hidden_dim, activation_fn, layer_norm, simba_encoder, n_head)
 
     @nnx.vmap(in_axes=(0, None, None))
     def __call__(self, observations: Any, actions: jax.Array) -> jax.Array:
         q = self.critic(observations, actions)
-        return q    # (num_q, B,, 1)
+        return q    # (num_q, B, n_head)
 
 
 
