@@ -1,21 +1,22 @@
-from __future__ import annotations
-
 import jax
 import jax.numpy as jnp
 from flax import nnx
 import flax.struct as struct
+from copy import deepcopy
 from mujoco_playground import MjxEnv
 from typing import Callable, Protocol
-from .network import Actor, Alpha
-from ...utils.network import DoubleCritic, soft_update
-from ...utils.replaybuffer import Batch, sample, add, ReplayBufferState
-from ...utils.normalization import RMSState, rms_normalize, rms_update
-from ...utils.evaluate import evaluate_policy
+from ..utils.network import (
+SquashedTanhGaussianActor, 
+Alpha,
+EnsembleCritic,
+soft_update)
+from ..utils.replaybuffer import Batch, JAXReplayBuffer, ReplayBuffer
+from ..utils.normalization import RMS
+from ..utils.evaluate import evaluate_policy
+from ..utils.checkpoint import load_states, save_states
 
 
 class SACConfig(Protocol):
-    # This protocol describes the minimal config interface required by SAC training code.
-    # Any object with these attributes (e.g., a dataclass from a script) can be used.
     seed: int
     total_timesteps: int
     num_envs: int
@@ -36,34 +37,88 @@ class SACConfig(Protocol):
     alpha: float
     target_entropy: float
 
+
 @struct.dataclass
 class TrainState:
-    actor: Actor
-    critic: DoubleCritic
+    actor: SquashedTanhGaussianActor
+    critic: EnsembleCritic
     actor_opt: nnx.Optimizer
     critic_opt: nnx.Optimizer
-    target_critic: DoubleCritic
+    target_critic: EnsembleCritic
 
-    
-    rb: ReplayBufferState
-    rms: RMSState | dict[str, RMSState] | None = None
-    grad_updates: int = 0  # number of critic gradient updates  
+
+    rms: RMS | None = None
+    grad_updates: int = 0  
     alpha: Alpha | None = None
     alpha_opt: nnx.Optimizer | None = None
 
+    @classmethod
+    def create(cls,
+    actor,
+    critic,
+    actor_opt,
+    critic_opt,
+    rms=None,
+    alpha=None,
+    alpha_opt=None):
+        target_critic = deepcopy(critic)
+        return cls(
+            actor=actor,
+            critic=critic,
+            target_critic=target_critic,
+            actor_opt=actor_opt,
+            critic_opt=critic_opt,
+            rms=rms,
+            alpha=alpha,
+            alpha_opt=alpha_opt,
+            grad_updates=0
+        )
+
+
+    def save(self, path: str):
+        save_states(path, {
+            "actor" : self.actor,
+            "critic": self.critic,
+            "target_critic": self.target_critic,
+            "actor_opt": self.actor_opt,
+            "critic_opt": self.critic_opt,
+            "rms": self.rms,
+            "alpha": self.alpha,
+            "alpha_opt": self.alpha_opt,
+            "grad_updates": self.grad_updates
+        })
+
+    def load(self, path: str):
+        state_map = load_states(path, {
+            "actor": self.actor,
+            "critic": self.critic,
+            "actor_opt": self.actor_opt,
+            "target_critic": self.target_critic,
+            "critic_opt": self.critic_opt,
+            "rms": self.rms,
+            "alpha": self.alpha,
+            "alpha_opt": self.alpha_opt,
+            "grad_updates": self.grad_updates
+        })
+
+        self.grad_updates = state_map["grad_updates"]
+
+
+
+    
 
 def update_critic(train_state: TrainState, config: SACConfig, batch: Batch, key: jax.Array):
     next_actions, next_log_pi = train_state.actor.get_action(
-        batch.next_observations, key)
+        batch.next_observations, key=key)
     next_q = train_state.target_critic(batch.next_observations, next_actions)
-    min_next_q = jnp.min(next_q, axis=1)
+    min_next_q = jnp.min(next_q, axis=0)
     alpha_value = train_state.alpha() if config.autotune else config.alpha
     target_q = batch.rewards + (1.0 - batch.dones) * config.gamma * (
         min_next_q - alpha_value * next_log_pi
     )
-    target_q = jax.lax.stop_gradient(target_q)[:, None, :]
+    target_q = jax.lax.stop_gradient(target_q)
 
-    def critic_loss_fn(critic_model: DoubleCritic):
+    def critic_loss_fn(critic_model: EnsembleCritic):
         q = critic_model(batch.observations, batch.actions)
         critic_loss = jnp.mean((q - target_q) ** 2)
         info = {
@@ -89,10 +144,10 @@ def update_actor(
     alpha_value = train_state.alpha() if config.autotune else config.alpha
     alpha_value = jax.lax.stop_gradient(alpha_value)
 
-    def actor_loss_fn(actor_model: Actor, critic_model: DoubleCritic):
-        actions, log_pi = actor_model.get_action(batch.observations, key)
+    def actor_loss_fn(actor_model: SquashedTanhGaussianActor, critic_model: EnsembleCritic):
+        actions, log_pi = actor_model.get_action(batch.observations, key=key)
         q = critic_model(batch.observations, actions)
-        min_q = jnp.min(q, axis=1)
+        min_q = jnp.min(q, axis=0)
         actor_loss = -jnp.mean(min_q - alpha_value * log_pi)
         return actor_loss, {"training/actor_loss": actor_loss}
 
@@ -110,7 +165,7 @@ def update_alpha(
     key: jax.Array,
 ) -> tuple[TrainState, dict[str, jax.Array]]:
     """Update entropy temperature (alpha) and return the updated TrainState."""
-    _, log_pi = train_state.actor.get_action(batch.observations, key)
+    log_pi = train_state.actor.get_action(batch.observations, key=key)[1]
     log_pi = jax.lax.stop_gradient(log_pi)
 
     def alpha_loss_fn(alpha_model: Alpha):
@@ -150,11 +205,6 @@ def update_policy(
     return updated_train_state, info
 
 
-def update_target_networks(train_state: TrainState, config: SACConfig) -> TrainState:
-    """Soft-update target critic parameters and return the updated TrainState."""
-    soft_update(train_state.critic, train_state.target_critic, config.tau)
-    return train_state
-
 
 def update_sac(train_state: TrainState, config: SACConfig, key: jax.Array, big_batch: Batch):
     """(multiple SGD steps per env step)."""
@@ -164,7 +214,7 @@ def update_sac(train_state: TrainState, config: SACConfig, key: jax.Array, big_b
             [big_batch.observations, big_batch.next_observations],
             axis=0,
         )
-        normalized_obs, rms = rms_normalize(stacked_obs, train_state.rms, update=True)
+        normalized_obs, rms = train_state.rms.normalize(stacked_obs, update=True)
         train_state = train_state.replace(rms=rms)
 
         batch_size = big_batch.observations.shape[0]
@@ -186,35 +236,22 @@ def update_sac(train_state: TrainState, config: SACConfig, key: jax.Array, big_b
         critic_key, policy_key = jax.random.split(key, 2)
         train_state, critic_info = update_critic(train_state, config, sub_batch, critic_key)
         train_state = train_state.replace(grad_updates=train_state.grad_updates + 1)
-        # keep info structure fixed
-        zero = jnp.array(0.0, dtype=jnp.float32)
-        default_alpha_value = train_state.alpha() if config.autotune else jnp.array(config.alpha, dtype=jnp.float32)
-        
-        policy_info_template = {
-            "training/actor_loss": zero,
-            "training/alpha_loss": zero,
-            "training/alpha_value": default_alpha_value,
-        }
-
-        def _do_policy_update(args):
-            train_state, policy_keys = args
-            train_state, policy_infos = update_policy(train_state, config, sub_batch, policy_keys)
-            return train_state, policy_infos
-
-        def _skip_policy_update(args):
-            train_state, policy_keys = args
-            return train_state, policy_info_template
+        alpha_value = train_state.alpha() if config.autotune else jnp.array(config.alpha, dtype=jnp.float32)
 
         train_state, policy_info = nnx.cond(
             train_state.grad_updates % config.policy_frequency == 0,
-            _do_policy_update,
-            _skip_policy_update,
-            (train_state, policy_key),
+            lambda ts: update_policy(ts, config, sub_batch, policy_key),
+            lambda ts: (ts, {
+            "training/actor_loss": jnp.array(0.0),
+            "training/alpha_loss": jnp.array(0.0),
+            "training/alpha_value": alpha_value,
+            }),
+            train_state,
         )
-        train_state = nnx.cond(
+        nnx.cond(
             train_state.grad_updates % config.target_frequency == 0,
-            lambda ts: update_target_networks(ts, config),
-            lambda ts: ts,
+            lambda ts: soft_update(ts.critic, ts.target_critic, config.tau),
+            lambda ts: None,
             train_state,
         )
 
@@ -231,14 +268,14 @@ def sample_and_update_sac(
     train_state: TrainState,
     config: SACConfig,
     key: jax.Array,
+    rb: JAXReplayBuffer
 ) -> tuple[TrainState, dict[str, jax.Array]]:
     """(multiple SGD steps per env step)."""
     assert train_state.rb is not None, "Replay buffer state must be initialized"
     sample_key, update_key = jax.random.split(key, 2)
 
     # 1) sample one big batch, then reshape to (grad_step_per_env_step, batch_size, ...)
-    big_batch = sample(
-        train_state.rb,
+    big_batch = rb.sample(
         sample_key,
         config.batch_size * config.grad_step_per_env_step
     )

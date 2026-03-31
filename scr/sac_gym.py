@@ -1,14 +1,11 @@
-
-from re import split
 import nnxrl.utils.logger as wandb
 from flax import nnx
-from nnxrl.utils.replaybuffer import init_replay_buffer, add
+from nnxrl.utils.replaybuffer import ReplayBuffer
 from typing import Literal, Sequence
-from nnxrl.agents.sac.train import sample_and_update_sac, TrainState
-from nnxrl.agents.sac.network import Actor, Alpha
-from nnxrl.utils.network import DoubleCritic, copy_model
+from nnxrl.agents.sac import update_sac, TrainState
+from nnxrl.utils.network import EnsembleCritic, SquashedTanhGaussianActor, Alpha
 from nnxrl.utils.dmc_wrapper import make_env_dmc
-from nnxrl.utils.normalization import rms_init, rms_normalize
+from nnxrl.utils.normalization import RMS
 import time
 import numpy as np
 import jax
@@ -103,7 +100,7 @@ def main():
     wandb.init(project='sac', config=vars(args), name=f'{args.env_id}/decay_step_{args.decay_step}')
 
     rngs = nnx.Rngs(args.seed)
-    actor = Actor(
+    actor = SquashedTanhGaussianActor(
         obs_dim, action_dim, rngs.fork(),
         hidden_dim=args.hidden_dim,
         action_high=envs.single_action_space.high,
@@ -111,7 +108,7 @@ def main():
         activation_fn=activation_fn,
         simba_encoder=args.simba
     )
-    critic = DoubleCritic(
+    critic = EnsembleCritic(
         obs_dim,
         action_dim,
         rngs.fork(split=args.num_q),
@@ -119,41 +116,37 @@ def main():
         activation_fn=activation_fn,
         simba_encoder=args.simba
     )
-    target_critic = copy_model(critic)
     alpha = Alpha() if args.autotune else None
     actor_opt = nnx.Optimizer(actor, optax.adamw(args.policy_lr, weight_decay=1e-2)) if args.simba else nnx.Optimizer(actor, optax.adam(args.policy_lr))
     critic_opt = nnx.Optimizer(critic, optax.adamw(args.q_lr, weight_decay=1e-2)) if args.simba else nnx.Optimizer(critic, optax.adam(args.q_lr))
     alpha_opt = nnx.Optimizer(alpha, optax.adam(args.policy_lr)) if args.autotune else None
 
-    buffer_state = init_replay_buffer(
-        envs.single_observation_space.shape,
-        envs.single_action_space.shape,
+    rb = ReplayBuffer(
+        envs.single_observation_space,
+        envs.single_action_space,
         args.buffer_size,
         n_envs=args.num_envs,
         linear_decay_steps=args.decay_step
     )
 
     if args.normalize_observation:
-        rms = rms_init(envs.single_observation_space.shape)
+        rms = RMS.create(envs.single_observation_space.shape)
     else:
         rms = None
 
-    train_state = TrainState(actor, critic,
-                             actor_opt, critic_opt, target_critic, buffer_state, rms, alpha=alpha, alpha_opt=alpha_opt)
+    train_state = TrainState.create(actor, critic, actor_opt, critic_opt, rms, alpha=alpha, alpha_opt=alpha_opt)
     start_time = time.time()
-    jit_add = nnx.jit(add, donate_argnums=0)
-
+    @nnx.jit
     def get_action(actor, rms, obs, key):
         if args.normalize_observation:
-            obs_for_policy, rms = rms_normalize(obs, rms)
+            obs_for_policy, rms = rms.normalize(obs, rms)
         else:
             obs_for_policy = obs
-        actions, _ = actor.get_action(obs_for_policy, key)
+        actions, _ = actor.get_action(obs_for_policy, key=key)
         return rms, actions
 
-    jit_get_action = nnx.jit(get_action, donate_argnums=(0, 1))
-    jit_update = nnx.jit(lambda ts, key: sample_and_update_sac(
-        ts, args, key), donate_argnums=0)
+    jit_update = nnx.jit(lambda ts, big_batch, key: update_sac(
+        ts, args, key, big_batch), donate_argnums=0)
     obs, _ = envs.reset(seed=args.seed)
     action_key, update_key = jax.random.split(jax.random.PRNGKey(args.seed))
     for global_step in range(1, args.total_timesteps + 1):
@@ -161,7 +154,7 @@ def main():
             actions = np.array([envs.single_action_space.sample()
                                for _ in range(args.num_envs)])
         else:
-            rms, actions = jit_get_action(
+            rms, actions = get_action(
                 train_state.actor, train_state.rms, obs, jax.random.fold_in(action_key, global_step))
             train_state = train_state.replace(rms=rms)
             actions = np.asarray(actions)
@@ -193,19 +186,19 @@ def main():
             if trunc:
                 real_next_obs[idx] = infos["final_obs"][idx]
 
-        new_rb = jit_add(
-            train_state.rb,
+        rb.add(
             obs,
             actions,
             rewards,
             real_next_obs,
             terminations,
         )
-        train_state = train_state.replace(rb=new_rb)
 
         if global_step >= args.learning_starts:
+            big_batch = rb.sample(
+                args.batch_size * args.grad_step_per_env_step)
             train_state, info = jit_update(
-                train_state, jax.random.fold_in(
+                train_state, big_batch, jax.random.fold_in(
                     update_key, global_step)
             )
             if global_step % 999 == 0:

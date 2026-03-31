@@ -1,12 +1,10 @@
-from re import split
 import nnxrl.utils.logger as wandb
 from flax import nnx
 from typing import Literal, Sequence
-from nnxrl.utils.replaybuffer import init_replay_buffer, add
-from nnxrl.agents.td3.train import sample_and_update_td3, TrainState
-from nnxrl.utils.normalization import rms_init, rms_normalize
-from nnxrl.agents.td3.network import Actor
-from nnxrl.utils.network import DoubleCritic, copy_model
+from nnxrl.utils.replaybuffer import ReplayBuffer
+from nnxrl.agents.td3 import update_td3, TrainState
+from nnxrl.utils.normalization import RMS
+from nnxrl.utils.network import EnsembleCritic, TanhDetActor
 from nnxrl.utils.dmc_wrapper import make_env_dmc
 import time
 import numpy as np
@@ -38,11 +36,11 @@ class Args:
     hidden_dim: Sequence[int] = (256, 256)
     num_q: int = 2
 
-    # Automatically set for DMC environments, can be overridden manually
+
     action_repeat: int = 2
     normalize_observation: Literal[True, False] = False
     simba: Literal[True, False] = False
-    decay_step: int = 0  # 0 means uniformal sampling
+    decay_step: int = 0  
     grad_step_per_env_step: int = 1
 
 
@@ -102,39 +100,49 @@ def main():
                name=f'{args.env_id}//decay_step_{args.decay_step}')
 
     rngs = nnx.Rngs(args.seed)
-    actor = Actor(obs_dim, action_dim,
-                  rngs.fork(), hidden_dim=args.hidden_dim, action_high=envs.single_action_space.high, action_low=envs.single_action_space.low, activation_fn=activation_fn, simba_encoder=args.simba)
-    target_actor = copy_model(actor)
+    actor = TanhDetActor(
+        obs_dim, 
+        action_dim,
+        rngs.fork(), 
+        hidden_dim=args.hidden_dim, 
+        action_high=envs.single_action_space.high, 
+        action_low=envs.single_action_space.low, 
+        activation_fn=activation_fn, 
+        simba_encoder=args.simba)
 
-    critic = DoubleCritic(
-        obs_dim, action_dim, rngs.fork(split=args.num_q), hidden_dim=args.hidden_dim, activation_fn=activation_fn, simba_encoder=args.simba)
+    critic = EnsembleCritic(
+        obs_dim, 
+        action_dim, 
+        rngs.fork(split=args.num_q), 
+        hidden_dim=args.hidden_dim, 
+        activation_fn=activation_fn, 
+        simba_encoder=args.simba)
 
-    target_critic = copy_model(critic)
 
     actor_opt = nnx.Optimizer(actor, optax.adamw(
         args.policy_lr, weight_decay=1e-2)) if args.simba else nnx.Optimizer(actor, optax.adam(args.policy_lr))
     critic_opt = nnx.Optimizer(critic, optax.adamw(
         args.q_lr, weight_decay=1e-2)) if args.simba else nnx.Optimizer(critic, optax.adam(args.q_lr))
 
-    buffer_state = init_replay_buffer(
-        envs.single_observation_space.shape,
-        envs.single_action_space.shape,
+    rb = ReplayBuffer(
+        envs.single_observation_space,
+        envs.single_action_space,
         args.buffer_size,
         n_envs=args.num_envs,
         linear_decay_steps=args.decay_step
     )
     if args.normalize_observation:
-        rms = rms_init(envs.single_observation_space.shape)
+        rms = RMS.create(envs.single_observation_space.shape)
     else:
         rms = None
-    train_state = TrainState(actor, critic, target_actor, target_critic, actor_opt, critic_opt,
-                             buffer_state, rms)
+    train_state = TrainState.create(actor=actor, critic=critic, actor_opt=actor_opt, critic_opt=critic_opt,
+                             rb=rb, rms=rms)
     start_time = time.time()
-    jit_add = nnx.jit(add, donate_argnums=0)
 
+    @nnx.jit
     def get_action_with_exploration_noise(actor, rms, obs, key):
         if args.normalize_observation:
-            obs_for_policy, rms = rms_normalize(obs, rms)
+            obs_for_policy, rms = rms.normailze(obs, rms)
         else:
             obs_for_policy = obs
         actions = actor.get_action(obs_for_policy)
@@ -143,11 +151,9 @@ def main():
             noise + actions, envs.single_action_space.low,  envs.single_action_space.high)
         return rms, actions
 
-    jit_get_action = nnx.jit(
-        get_action_with_exploration_noise, donate_argnums=(0, 1))
+    jit_update = nnx.jit(lambda ts, big_batch, key: update_td3(
+        ts, args, key, big_batch), donate_argnums=0)
 
-    jit_update = nnx.jit(lambda ts, key: sample_and_update_td3(
-        ts, args, key), donate_argnums=0)
     obs, _ = envs.reset(seed=args.seed)
     step_key, update_key = jax.random.split(jax.random.PRNGKey(args.seed), 2)
 
@@ -156,7 +162,7 @@ def main():
             actions = np.array([envs.single_action_space.sample()
                                for _ in range(args.num_envs)])
         else:
-            rms, actions = jit_get_action(
+            rms, actions = get_action_with_exploration_noise(
                 train_state.actor, train_state.rms, obs, jax.random.fold_in(step_key, global_step))
             train_state = train_state.replace(rms=rms)
             actions = np.asarray(actions)
@@ -188,19 +194,18 @@ def main():
             if trunc:
                 real_next_obs[idx] = infos["final_obs"][idx]
 
-        new_rb = jit_add(
-            train_state.rb,
+        rb.add(
             obs,
             actions,
             rewards,
             real_next_obs,
             terminations,
         )
-        train_state = train_state.replace(rb=new_rb)
 
         if global_step >= args.learning_starts:
+            big_batch = rb.sample(args.batch_size * args.grad_step_per_env_step)
             train_state, info = jit_update(
-                train_state, jax.random.fold_in(
+                train_state, big_batch, jax.random.fold_in(
                     update_key, global_step)
             )
             if global_step % 999 == 0:

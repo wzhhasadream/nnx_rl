@@ -1,111 +1,80 @@
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from .policy import split_observation, flattened_dim
-
-
-def orthogonal(scale: jax.Array = jnp.sqrt(2)):
-    return nnx.initializers.orthogonal(scale)
-
-
-class MLP(nnx.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dims: list[int],
-        rngs: nnx.Rngs,
-        layer_norm: bool = False,
-        activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.relu
-    ):
-        dims = [in_dim] + list(hidden_dims)
-
-        self.layers = [
-            nnx.Linear(
-                dims[i], dims[i + 1],
-                rngs=rngs,
-                kernel_init=orthogonal() 
-            )
-            for i in range(len(hidden_dims))
-        ]
-
-        self.layer_norm = layer_norm
-        self.activation_fn = activation_fn
-        if layer_norm:
-            self.norms = [
-                nnx.LayerNorm(num_features=dims[i + 1], rngs=rngs)
-                for i in range(len(hidden_dims))
-            ]
-
-    def __call__(self, x):
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            if self.layer_norm:
-                x = self.norms[i](x)
-            x = self.activation_fn(x)
-
-        return x
-
+from .time_embedding import TimeEmbedding
+from .layer import MLP, SimBaEncoder, orthogonal
+from .policy import (
+    SquashedTanhGaussianPolicy,
+    TanhDeterministicPolicy,
+    GaussianPolicy,
+    flattened_dim,
+)
 
 class QNetwork(nnx.Module):
-    """
-    Supports both:
-        - plain observation arrays: `obs: (B, obs_dim)`
-        - dict observations with privileged critic inputs:
-            {
-            "state": (B, actor_obs_dim),
-            "privileged_state": (B, critic_obs_dim),
-            }
-
-    The actor always uses the "state" part.
-    The critic prefers "privileged_state" when available.
-    """
-
-    def __init__(self, obs_dim: int | dict[str, tuple],
+    def __init__(self, obs_dim: int | tuple[int, ...],
                  action_dim: int,
                  rngs: nnx.Rngs,
                  hidden_dim=(256, 256),
-                 activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.relu,
+                 activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
                  layer_norm: bool = False,
                  simba_encoder: bool = False
                  ):
-        if isinstance(obs_dim, dict):
-            if "privileged_state" in obs_dim:
-                self.critic_obs_dim = flattened_dim(
-                    obs_dim["privileged_state"])
-            else:
-                raise KeyError(
-                    "critic obs dim dict must contain 'privileged_state' ")
-        else:
-            self.critic_obs_dim = flattened_dim(obs_dim)
+        self.obs_dim = flattened_dim(obs_dim)
         if simba_encoder:
             self.mlp = SimBaEncoder(
-                self.critic_obs_dim + action_dim, 512, 2, rngs)
+                self.obs_dim + action_dim, 512, 2, rngs)
             out_dim = 512
         else:
-            self.mlp = MLP(self.critic_obs_dim + action_dim, list(hidden_dim),
+            self.mlp = MLP(self.obs_dim + action_dim, list(hidden_dim),
                            rngs=rngs, layer_norm=layer_norm, activation_fn=activation_fn)
             out_dim = hidden_dim[-1]
         self.out = nnx.Linear(
             out_dim, 1, rngs=rngs, kernel_init=orthogonal())
 
     def __call__(self, x, a):
-        _, obs_for_critic = split_observation(x)
-        h = jnp.concatenate([obs_for_critic, a], axis=1)
+        h = jnp.concatenate([x, a], axis=1)
         h = self.mlp(h)
         return self.out(h)
 
 
-class DoubleCritic(nnx.Module):
-    """Double Q network using NNX API."""
+class VNetwork(nnx.Module):
+    def __init__(self, obs_dim: int | tuple[int, ...],
+                 rngs: nnx.Rngs,
+                 hidden_dim=(256, 256),
+                 activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
+                 layer_norm: bool = False,
+                 simba_encoder: bool = False
+                 ):
+        self.obs_dim = flattened_dim(obs_dim)
+        if simba_encoder:
+            self.mlp = SimBaEncoder(
+                self.obs_dim, 512, 2, rngs)
+            out_dim = 512
+        else:
+            self.mlp = MLP(self.obs_dim, list(hidden_dim),
+                           rngs=rngs, layer_norm=layer_norm, activation_fn=activation_fn)
+            out_dim = hidden_dim[-1]
+        self.out = nnx.Linear(
+            out_dim, 1, rngs=rngs, kernel_init=orthogonal())
+
+    def __call__(self, x):
+        h = self.mlp(x)
+        return self.out(h)
+
+
+
+class EnsembleCritic(nnx.Module):
+    """Ensemble Q network using NNX API."""
     @nnx.vmap(in_axes=(0, None, None, 0, None, None, None, None))
     def __init__(
-        self, 
+        self,
         obs_dim: int,
         action_dim: int,
         rngs: nnx.Rngs,
-        hidden_dim=(256, 256),
-        activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.relu,
+        hidden_dim: Sequence[int] = (256, 256),
+        activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
         layer_norm: bool = False,
         simba_encoder: bool = False
     ):
@@ -113,21 +82,15 @@ class DoubleCritic(nnx.Module):
         self.critic = QNetwork(
             obs_dim, action_dim, rngs, hidden_dim, activation_fn, layer_norm, simba_encoder)
 
-    @nnx.vmap(in_axes=(0, None, None), out_axes=(1))
+    @nnx.vmap(in_axes=(0, None, None))
     def __call__(self, observations: Any, actions: jax.Array) -> jax.Array:
         q = self.critic(observations, actions)
-        return q    # (B, num_q, 1)
+        return q    # (num_q, B,, 1)
 
 
-def copy_model(copied_model: nnx.Module) -> nnx.Module:
-    state = nnx.state(copied_model)
-    model = nnx.clone(copied_model)
-    copied_state = jax.tree.map(lambda x: jnp.asarray(x, copy=True), state)
-    nnx.update(model, copied_state)
-    return model
 
 
-def soft_update(online: nnx.Module, target_net: nnx.Module, tau: float = 0.05):
+def soft_update(online: nnx.Module, target_net: nnx.Module, tau: float = 0.005) -> None:
     """Soft-update network parameters."""
     online_params = nnx.state(online, nnx.Param)
     target_params = nnx.state(target_net, nnx.Param)
@@ -138,199 +101,236 @@ def soft_update(online: nnx.Module, target_net: nnx.Module, tau: float = 0.05):
         target_params,
     )
     nnx.update(target_net, new_params)
-    return target_net
 
 
-# Adapted from SimBa: https://github.com/SonyResearch/simba/blob/master/scale_rl/networks/layers.py
-class ResidualBlock(nnx.Module):
-    """
-    Residual block used in SimBa architecture.
-
-    Architecture:
-    - LayerNorm
-    - Linear(hidden_dim -> hidden_dim * 4) + ReLU
-    - Linear(hidden_dim * 4 -> hidden_dim)
-    - Residual connection
-    """
-
+class TanhDetActor(nnx.Module):
     def __init__(
         self,
-        hidden_dim: int,
-        rngs: nnx.Rngs = nnx.Rngs(0)
+        obs_dim: int | tuple[int, ...],
+        action_dim: int,
+        rngs: nnx.Rngs,
+        hidden_dim: Sequence[int] = (256, 256),
+        action_high: jax.Array = 1,
+        action_low: jax.Array = -1,
+        activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
+        layer_norm: bool = False,
+        simba_encoder: bool = False
     ):
-        self.hidden_dim = hidden_dim
+        self.action_high = action_high
+        self.action_low = action_low
+        self.action_scale = (action_high - action_low) / 2
+        self.action_dim = action_dim
 
-        # Layer normalization
-        self.layer_norm = nnx.LayerNorm(
-            num_features=hidden_dim,
-            rngs=rngs
-        )
+        self.obs_dim = flattened_dim(obs_dim)
+        if simba_encoder:
+            self.encoder = SimBaEncoder(self.obs_dim, 128, 1, rngs)
+            out_dim = 128
+        else:
+            self.encoder = MLP(self.obs_dim,
+                               hidden_dim, rngs, layer_norm, activation_fn=activation_fn)
+            out_dim = hidden_dim[-1]
 
-        # Feedforward network with 4x expansion
-        self.dense1 = nnx.Linear(
-            in_features=hidden_dim,
-            out_features=hidden_dim * 4,
-            kernel_init=nnx.initializers.he_normal(),
-            rngs=rngs
-        )
+        self.actor_head = nnx.Linear(
+            out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
 
-        self.dense2 = nnx.Linear(
-            in_features=hidden_dim * 4,
-            out_features=hidden_dim,
-            kernel_init=nnx.initializers.he_normal(),  
-            rngs=rngs
-        )
+        self.policy = TanhDeterministicPolicy(
+            self.action_low, self.action_high)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        """Forward pass with residual connection."""
-        # Store residual connection
-        residual = x
-
-        # Pre-norm residual block
-        x = self.layer_norm(x)
-        x = self.dense1(x)
-        x = nnx.relu(x)
-        x = self.dense2(x)
-
-        # Add residual connection
-        return residual + x
+    def get_action(self, x: jax.Array) -> jax.Array:
+        """Returns an action in [action_low, action_high].
+        """
+        pre_tanh = self.actor_head(self.encoder(x))
+        return self.policy.action(pre_tanh)
 
 
-# Adapted from SimBa:https://github.com/SonyResearch/simba/blob/master/scale_rl/agents/sac/sac_network.py#L33
-class SimBaEncoder(nnx.Module):
-    """
-    SimBa encoder residual block architectures.
 
-    Args:
-        input_dim: Dimension of input features
-        hidden_dim: Dimension of hidden layers
-        num_blocks: Number of residual blocks (default: 1)
-        rngs: Random number generators for initialization
-
-    Returns:
-        jnp.ndarray: Encoded features
-    """
-
+class SquashedTanhGaussianActor(nnx.Module):
     def __init__(
         self,
-        input_dim: int,
-        hidden_dim: int,
-        num_blocks: int = 1,
-        rngs: nnx.Rngs = nnx.Rngs(0)
+        obs_dim: int | tuple[int, ...],
+        action_dim: int,
+        rngs: nnx.Rngs,
+        hidden_dim: Sequence[int] = (256, 256),
+        action_high: jax.Array = 1,
+        action_low: jax.Array = -1,
+        activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
+        layer_norm: bool = False,
+        simba_encoder: bool = False,
+        log_std_min: jax.Array = -5,
+        log_std_max: jax.Array = 2,
+        squash_log_std: bool = True
     ):
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.num_blocks = num_blocks
 
-        self.input_projection = nnx.Linear(
-            in_features=input_dim,
-            out_features=hidden_dim,
-            kernel_init=orthogonal(1),
-            rngs=rngs
-        )
+        self.action_high = action_high
+        self.action_low = action_low
+        self.action_scale = (action_high - action_low) / 2
+        self.action_bias = (action_high + action_low) / 2
 
-        # Stack residual blocks
-        self.residual_blocks = [
-            ResidualBlock(hidden_dim, rngs=rngs)
-            for _ in range(num_blocks)
-        ]
+        self.obs_dim = flattened_dim(obs_dim)
+        if simba_encoder:
+            self.encoder = SimBaEncoder(self.obs_dim, 128, 1, rngs)
+            out_dim = 128
+        else:
+            self.encoder = MLP(self.obs_dim, hidden_dim, rngs, layer_norm,
+                               activation_fn=activation_fn)
+            out_dim = hidden_dim[-1]
+        self.fc_mean = nnx.Linear(
+            out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
+        self.fc_logstd = nnx.Linear(
+            out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
 
-        # Final layer norm
-        self.final_layer_norm = nnx.LayerNorm(
-            num_features=hidden_dim,
-            rngs=rngs
-        )
+        self.policy = SquashedTanhGaussianPolicy(
+            self.action_low, self.action_high, log_std_min, log_std_max, squash_log_std)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        """
-        Forward pass through the encoder.
+    def __call__(self, x: Any) -> Any:
+        x = self.encoder(x)
+        mean = self.fc_mean(x)
+        log_std = self.fc_logstd(x)
+        return self.policy.dist(mean, log_std)
 
-        Args:
-            x: Input tensor of shape (batch_size, input_dim)
+    def get_action(self, x: Any, *, key: jax.Array | None = None, actions: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
+        action_distribution = self(x)
+        if actions is not None:
+            eps = jnp.asarray(1e-6, dtype=jnp.asarray(actions).dtype)
+            actions = jnp.clip(actions, self.action_low +
+                               eps, self.action_high - eps)
+        else:
+            actions = action_distribution.sample(seed=key)
+        log_prob = action_distribution.log_prob(actions)
 
-        Returns:
-            encoded: Encoded features of shape (batch_size, hidden_dim)
-        """
-        # Initial projection
-        x = self.input_projection(x)
+        # (batch_size, action_dim), (batch_size, 1)
+        return actions, log_prob[:, None]
 
-        # Apply residual blocks
-        for block in self.residual_blocks:
-            x = block(x)
+    def get_mean_action(self, x: Any) -> jax.Array:
+        h = self.encoder(x)
+        mean = self.fc_mean(h)
 
-        # Final layer normalization
-        x = self.final_layer_norm(x)
-
-        return x
-
-
-
-
-        
+        return jnp.tanh(mean) * self.action_scale + self.action_bias
 
 
-# Adapted from ProcGen starter kit: https://github.com/AIcrowd/neurips2020-procgen-starter-kit/blob/142d09586d2272a17f44481a115c4bd817cf6a94/models/impala_cnn_torch.py
-class CNNResidualBlock(nnx.Module):
-    """A simple residual block with two 3x3 convolutions.
+class GaussianActor(nnx.Module):
+    def __init__(
+        self,
+        obs_dim: int | tuple[int, ...],
+        action_dim: int,
+        rngs: nnx.Rngs,
+        hidden_dim: Sequence[int] = (256, 256),
+        action_high: jax.Array = 1,
+        action_low: jax.Array = -1,
+        activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
+        layer_norm: bool = False,
+        simba_encoder: bool = False,
+        log_std_min: jax.Array = -20,
+        log_std_max: jax.Array = 2,
+        squash_log_std: bool = False
+    ):
 
-    This block applies:
-      ReLU -> Conv(3x3) -> ReLU -> Conv(3x3) -> residual add
+        self.action_high = action_high
+        self.action_low = action_low
+        self.action_scale = (action_high - action_low) / 2
+        self.action_bias = (action_high + action_low) / 2
 
-    """
+        self.obs_dim = flattened_dim(obs_dim)
+        if simba_encoder:
+            self.encoder = SimBaEncoder(self.obs_dim, 128, 1, rngs)
+            out_dim = 128
+        else:
+            self.encoder = MLP(self.obs_dim, hidden_dim, rngs, layer_norm,
+                               activation_fn=activation_fn)
+            out_dim = hidden_dim[-1]
+        self.fc_mean = nnx.Linear(
+            out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
+        self.fc_logstd = nnx.Linear(
+            out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
 
-    def __init__(self, channels: int, rngs: nnx.Rngs):
-        super().__init__()
-        self.conv0 = nnx.Conv(in_features=channels, out_features=channels,
-                              kernel_size=3, padding=1, kernel_init=orthogonal(), rngs=rngs)
-        self.conv1 = nnx.Conv(in_features=channels, out_features=channels,
-                              kernel_size=3, padding=1, kernel_init=orthogonal(), rngs=rngs)
+        self.policy = GaussianPolicy(log_std_min, log_std_max, squash_log_std)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        inputs = x
-        x = jax.nn.relu(x)
-        x = self.conv0(x)
-        x = jax.nn.relu(x)
-        x = self.conv1(x)
-        return x + inputs
+    def __call__(self, x: Any) -> Any:
+        x = self.encoder(x)
+        mean = self.fc_mean(x)
+        log_std = self.fc_logstd(x)
+        return self.policy.dist(mean, log_std)
+
+    def get_action(self, x: Any, *, key: jax.Array | None = None, actions: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
+        action_distribution = self(x)
+        if actions is not None:
+            actions = actions
+        else:
+            actions = action_distribution.sample(seed=key)
+        log_prob = action_distribution.log_prob(actions)
+        entropy = action_distribution.entropy()
+
+        # (batch_size, action_dim), (batch_size, 1), (batch_size, 1)
+        return jnp.clip(actions, self.action_low, self.action_high), log_prob[:, None], entropy[:, None]
+
+    def get_mean_action(self, x: Any) -> jax.Array:
+        h = self.encoder(x)
+        mean = self.fc_mean(h)
+
+        return jnp.clip(mean, self.action_low, self.action_high)
 
 
-class ConvSequence(nnx.Module):
-    """A convolutional feature extractor stage: Conv + downsampling + residual blocks.
+class FlowActor(nnx.Module):
+    def __init__(
+        self,
+        obs_dim: int | tuple[int, ...],
+        action_dim: int,
+        rngs: nnx.Rngs,
+        hidden_dim: Sequence[int] = (256, 256),
+        action_high: jax.Array = 1,
+        action_low: jax.Array = -1,
+        activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
+        layer_norm: bool = False,
+        simba_encoder: bool = False,
+        emb_dim: int = 64,
+        euler_steps: int = 10
+    ):
 
-    Structure:
-      - 3x3 convolution to `out_channels`
-      - 3x3 max-pooling with stride 2 (spatial downsample by ~2)
-      - Two residual blocks
+        self.action_high = action_high
+        self.action_low = action_low
+        self.action_scale = (action_high - action_low) / 2
+        self.action_bias = (action_high + action_low) / 2
+        self.euler_steps = euler_steps
+        self.action_dim = action_dim
 
-    Notes:
-        - Input shape should be (H, W, C) for NHWC tensors.
-        - Output shape is (ceil(H/2), ceil(W/2), out_channels) with "SAME" pooling.
-    """
+        self.obs_dim = flattened_dim(obs_dim)
+        if simba_encoder:
+            self.encoder = SimBaEncoder(self.obs_dim + self.action_dim + emb_dim, 128, 1, rngs)
+            out_dim = 128
+        else:
+            self.encoder = MLP(self.obs_dim + self.action_dim + emb_dim, hidden_dim, rngs, layer_norm,
+                               activation_fn=activation_fn)
+            out_dim = hidden_dim[-1]
+        self.time_embed = TimeEmbedding(emb_dim=emb_dim, rngs=rngs)
+        self.head = nnx.Linear(out_dim, action_dim,
+                               rngs=rngs, kernel_init=orthogonal())
 
-    def __init__(self, input_shape: tuple[int, int, int], out_channels: int, rngs: nnx.Rngs):
-        super().__init__()
-        self._input_shape = input_shape
-        self._out_channels = out_channels
-        # input_shape is expected to be (H, W, C) for NHWC inputs.
-        self.conv = nnx.Conv(
-            in_features=self._input_shape[2],
-            out_features=self._out_channels,
-            kernel_size=3,
-            padding=1,
-            rngs=rngs
-        )
-        self.res_block0 = CNNResidualBlock(self._out_channels, rngs=rngs)
-        self.res_block1 = CNNResidualBlock(self._out_channels, rngs=rngs)
+    def get_v(self, obs: jax.Array, x_t: jax.Array, t: jax.Array) -> jax.Array:
+        t_emb = self.time_embed(t)
+        inputs = jnp.concatenate([obs, x_t, t_emb], axis=1)
+        x = self.encoder(inputs)
+        return self.head(x)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        x = self.conv(x)
 
-        x = nnx.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding="SAME")
-        x = self.res_block0(x)
-        x = self.res_block1(x)
+    def get_action(self, x: jax.Array, key: jax.Array) -> jax.Array:
+        batch_size = x.shape[0]
+        a_i = jax.random.normal(key, shape=(batch_size, self.action_dim))
 
-        return x
+        for i in range(self.euler_steps):
+            t = jnp.full((batch_size, 1), (i + 0.5) / self.euler_steps)
+            dt = 1.0 / self.euler_steps
+            a_i = a_i + dt * self.get_v(x, a_i, t)
 
-    def get_output_shape(self):
-        h,w,c = self._input_shape
-        return ((h + 1) // 2, (w + 1) // 2, self._out_channels)
+        actions = jnp.clip(a_i, self.action_low, self.action_high)
+
+        return actions
+
+
+
+
+class Alpha(nnx.Module):
+    def __init__(self, init_value: float = 0.0):
+        self.log_alpha = nnx.Param(jnp.asarray(init_value))
+
+    def __call__(self) -> jax.Array:
+        return jnp.exp(self.log_alpha.value)

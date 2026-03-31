@@ -1,20 +1,17 @@
-from __future__ import annotations
-
+from copy import deepcopy
 from typing import Dict, Tuple, Callable, Protocol
 import jax
 import jax.numpy as jnp
 from flax import nnx, struct
-from ...utils.normalization import RMSState, rms_normalize, rms_update
-from ...utils.replaybuffer import Batch, ReplayBufferState, add, sample
-from .network import Actor
-from ...utils.network import DoubleCritic, soft_update
+from ..utils.normalization import RMS
+from ..utils.replaybuffer import Batch, JAXReplayBuffer
+from ..utils.network import TanhDetActor, soft_update, EnsembleCritic
 from mujoco_playground import MjxEnv, State
-from ...utils.evaluate import evaluate_policy
+from ..utils.evaluate import evaluate_policy
+from ..utils.checkpoint import load_states, save_states
 
 
 class TD3Config(Protocol):
-    # This protocol describes the minimal config interface required by TD3 training code.
-    # Any object with these attributes (e.g., a dataclass from a script) can be used.
     seed: int
     total_timesteps: int
     num_envs: int
@@ -29,7 +26,6 @@ class TD3Config(Protocol):
     policy_frequency: int
 
     policy_lr: float
-    actor_noise: float | None
 
     normalize_observation: bool
     exploration_noise: float
@@ -41,45 +37,70 @@ class TD3Config(Protocol):
 class TrainState:
     """Mutable TD3 training state (models + optimizer states)."""
 
-    actor: Actor
-    critic: DoubleCritic
-    target_actor: Actor
-    target_critic: DoubleCritic
+    actor: TanhDetActor
+    critic: EnsembleCritic
+    target_actor: TanhDetActor
+    target_critic: EnsembleCritic
     actor_opt: nnx.Optimizer
     critic_opt: nnx.Optimizer
 
-    rb: ReplayBufferState = None
-    rms: RMSState | dict[str, RMSState] | None = None
-    grad_updates: int = 0  # number of critic gradient updates  
+    rms: RMS | None = None
+    grad_updates: int = 0  
+
+    @classmethod
+    def create(cls,
+    actor,
+    critic,
+    actor_opt,
+    critic_opt,
+    rb=None,
+    rms=None):
+        target_actor = deepcopy(actor)
+        target_critic = deepcopy(critic)
+        return cls(
+            actor=actor,
+            critic=critic,
+            target_actor=target_actor,
+            target_critic=target_critic,
+            actor_opt=actor_opt,
+            critic_opt=critic_opt,
+            rms=rms,
+            grad_updates=0
+        )
+
+    def save(self, path: str):
+        save_states(path, {
+            "actor" : self.actor,
+            "critic": self.critic,
+            "actor_opt": self.actor_opt,
+            "critic_opt": self.critic_opt,
+            "target_critic": self.target_critic,
+            "target_actor": self.target_actor,
+            "rms": self.rms,
+            "grad_updates": self.grad_updates
+        })
+
+    def load(self, path: str):
+        state_map = load_states(path, {
+            "actor" : self.actor,
+            "critic": self.critic,
+            "actor_opt": self.actor_opt,
+            "critic_opt": self.critic_opt,
+            "target_critic": self.target_critic,
+            "target_actor": self.target_actor,
+            "rms": self.rms,
+            "grad_updates": self.grad_updates
+        })
+
+        self.grad_updates = state_map["grad_updates"]
 
 
-
-
-
-
-
-def _add_gaussian_noise_to_grads(grads, *, key: jax.Array, std: float):
-    """Adds N(0, std^2) noise to every array leaf in a gradient pytree."""
-    std = float(std)
-    if std <= 0.0:
-        return grads
-
-    leaves, treedef = jax.tree_util.tree_flatten(grads)
-    keys = jax.random.split(key, len(leaves)) if leaves else ()
-    noisy_leaves = []
-    for leaf, k in zip(leaves, keys):
-        if isinstance(leaf, jax.Array):
-            noise = jax.random.normal(k, shape=leaf.shape, dtype=leaf.dtype) * std
-            noisy_leaves.append(leaf + noise)
-        else:
-            noisy_leaves.append(leaf)
-    return jax.tree_util.tree_unflatten(treedef, noisy_leaves)
 
 
 
 
 def _target_policy_smoothing(
-    target_actor: Actor,
+    target_actor: TanhDetActor,
     next_observations: jax.Array,
     *,
     key: jax.Array,
@@ -104,7 +125,7 @@ def update_critic(
     config: TD3Config,
     batch: Batch,
     key: jax.Array,
-) -> Tuple[TrainState, Dict[str, jax.Array]]:
+) -> tuple[TrainState, dict[str, jax.Array]]:
     """Update TD3 critics and return the updated TrainState."""
     target_key, _ = jax.random.split(key)
     smoothed_actions = _target_policy_smoothing(
@@ -114,13 +135,14 @@ def update_critic(
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
     )
-    target_q = train_state.target_critic(batch.next_observations, smoothed_actions)
-    min_q = jnp.min(target_q, axis=1)
+    target_q = train_state.target_critic(batch.next_observations, smoothed_actions)    # [num_q, B, 1]
+    min_q = jnp.min(target_q, axis=0)                                                  # [B, 1]
     target_values = batch.rewards + config.gamma * (1.0 - batch.dones) * min_q
-    target_values = jax.lax.stop_gradient(target_values)[:, None, :]
+    target_values = jax.lax.stop_gradient(target_values)
 
-    def critic_loss_fn(critic: DoubleCritic):
+    def critic_loss_fn(critic):
         q = critic(batch.observations, batch.actions)
+        # [num_q, B, 1] - [B, 1]
         q_loss = jnp.mean((q - target_values) ** 2)
 
         info = {
@@ -142,26 +164,24 @@ def update_critic(
 def update_actor(
     train_state: TrainState,
     batch: Batch,
-) -> Tuple[TrainState, Dict[str, jax.Array]]:
+    config: TD3Config
+) -> tuple[TrainState, dict[str, jax.Array]]:
     """Update TD3 actor and return the updated TrainState.
     """
-    def actor_loss_fn(actor: Actor, critic: DoubleCritic):
+    def actor_loss_fn(actor, critic):
         actions = actor.get_action(batch.observations)
-        q = critic(batch.observations, actions)[:, 0, :]
+        q = critic(batch.observations, actions)[0]
         actor_loss = -jnp.mean(q)
         return actor_loss, {"training/actor_loss": actor_loss}
 
     (_loss, info), grads = nnx.value_and_grad(actor_loss_fn, has_aux=True, argnums=0)(train_state.actor, train_state.critic)
     train_state.actor_opt.update(grads)
 
+    soft_update(train_state.actor, train_state.target_actor, config.tau)
+    soft_update(train_state.critic, train_state.target_critic, config.tau)
+
     return train_state, info
 
-
-def update_targets(train_state: TrainState, tau: float) -> TrainState:
-    """Soft-update target actor and critic networks."""
-    soft_update(train_state.actor, train_state.target_actor, tau)
-    soft_update(train_state.critic, train_state.target_critic, tau)
-    return train_state
 
 
 
@@ -170,7 +190,7 @@ def update_td3(
     config: TD3Config,
     key: jax.Array,
     big_batch: Batch     
-) -> Tuple[TrainState, Dict[str, jax.Array]]:
+) -> tuple[TrainState, dict[str, jax.Array]]:
     """(multiple SGD steps per env step)."""
 
     if train_state.rms is not None and config.normalize_observation:
@@ -178,7 +198,7 @@ def update_td3(
             [big_batch.observations, big_batch.next_observations],
             axis=0,
         )
-        normalized_obs, rms = rms_normalize(stacked_obs, train_state.rms, update=True)
+        normalized_obs, rms = train_state.rms.normalize(stacked_obs, update=True)
         train_state = train_state.replace(rms=rms)
 
         batch_size = big_batch.observations.shape[0]
@@ -193,30 +213,20 @@ def update_td3(
         big_batch,
     )
 
-    update_keys = jax.random.split(key, config.grad_step_per_env_step)
     @nnx.scan(in_axes=(nnx.Carry, 0, 0), out_axes=(nnx.Carry, 0))
-    def update_td3_mininbatch(train_state, batch, key):
-        train_state, critic_info = update_critic(train_state, config, batch, key)
-        train_state = train_state.replace(grad_updates=train_state.grad_updates + 1)
+    def update_td3_mininbatch(ts, batch, step):
+        ts, critic_info = update_critic(ts, config, batch, jax.random.fold_in(key, step))
+        ts = ts.replace(grad_updates=ts.grad_updates + 1)
 
-        zero = jnp.array(0.0, dtype=jnp.float32)
-        policy_info_template = {"training/actor_loss": zero}
 
-        def _do_policy_update(ts: TrainState):
-            ts, actor_info = update_actor(
-                ts,
-                batch
-            )
-            ts = update_targets(ts, config.tau)
-            return ts, actor_info
+        ts, policy_info = nnx.cond(
+            train_state.grad_updates % config.policy_frequency == 0, 
+            lambda ts: update_actor(ts, batch, config), 
+            lambda ts: (ts, {"training/actor_loss": jnp.array(0.0)}),
+            ts)
+        return ts, {**critic_info, **policy_info}
 
-        def _skip_policy_update(ts: TrainState):
-            return ts, policy_info_template
-
-        train_state, policy_info = nnx.cond(train_state.grad_updates % config.policy_frequency == 0, _do_policy_update, _skip_policy_update, train_state)
-        return train_state, {**critic_info, **policy_info}
-
-    ts, infos = update_td3_mininbatch(train_state, batches, update_keys)
+    ts, infos = update_td3_mininbatch(train_state, batches, jnp.arange(config.grad_step_per_env_step))
 
     avg_info = jax.tree.map(jnp.mean, infos)
 
@@ -228,14 +238,13 @@ def sample_and_update_td3(
     train_state: TrainState,
     config: TD3Config,
     key: jax.Array,
+    rb: JAXReplayBuffer
 ) -> Tuple[TrainState, Dict[str, jax.Array]]:
     """(multiple SGD steps per env step)."""
-    assert train_state.rb is not None, "Replay buffer state must be initialized"
     sample_key, update_key = jax.random.split(key, 2)
 
     # 1) sample one big batch, then reshape to (grad_step_per_env_step, batch_size, ...)
-    big_batch = sample(
-        train_state.rb,
+    big_batch = rb.sample(
         sample_key,
         config.batch_size * config.grad_step_per_env_step
     )

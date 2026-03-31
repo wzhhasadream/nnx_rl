@@ -1,3 +1,4 @@
+from tkinter import W
 from typing import NamedTuple, Any
 import numpy as np
 import jax.numpy as jnp
@@ -373,8 +374,29 @@ class ReplayBuffer:
 #######################################################
 
 
+
+def _reshape_obs_leaf(x: Any, shape_spec: tuple[int, ...], n_envs: int, dtype: jnp.dtype) -> jax.Array:
+    x = jnp.asarray(x, dtype=dtype)
+    return x.reshape((n_envs, *shape_spec))
+
+
+def _reshape_action(x: Any, shape_spec: tuple[int, ...], n_envs: int, dtype: jnp.dtype) -> jax.Array:
+    x = jnp.asarray(x, dtype=dtype)
+    return x.reshape((n_envs, *shape_spec))
+
+
+def _reshape_scalar_vec(x: Any, n_envs: int, dtype: jnp.dtype) -> jax.Array:
+    x = jnp.asarray(x, dtype=dtype)
+    return x.reshape((n_envs,))
+
+
+def _gather_time_env(x: jax.Array, time_idx: jax.Array, env_idx: jax.Array) -> jax.Array:
+    return x[time_idx, env_idx]
+
+
+
 @struct.dataclass
-class ReplayBufferState:
+class JAXReplayBuffer:
     observations: ObsTree
     actions: jax.Array
     rewards: jax.Array
@@ -396,261 +418,248 @@ class ReplayBufferState:
     linear_decay_steps: int = struct.field(pytree_node=False, default=0)
     min_weight: float = struct.field(pytree_node=False, default=0.1)
 
+    @classmethod
+    def create(
+        cls,
+        observation_shape: tuple[int, ...] | dict[str, tuple[int, ...]] | int,
+        action_shape: tuple[int, ...],
+        capacity: int,
+        n_envs: int,
+        *,
+        obs_dtype: jnp.dtype = jnp.float32,
+        action_dtype: jnp.dtype = jnp.float32,
+        linear_decay_steps: int = 0,
+        min_weight: float = 0.1,
+    ) -> 'JAXReplayBuffer':
+        """Initialize a JIT-friendly replay buffer.
 
-def init_replay_buffer(
-    observation_shape: tuple[int, ...] | dict[str, tuple[int, ...]] | int,
-    action_shape: tuple[int, ...],
-    capacity: int,
-    n_envs: int,
-    *,
-    obs_dtype: jnp.dtype = jnp.float32,
-    action_dtype: jnp.dtype = jnp.float32,
-    linear_decay_steps: int = 0,
-    min_weight: float = 0.1,
-) -> ReplayBufferState:
-    """Initialize a JIT-friendly replay buffer.
+        Notes:
+        - `observation_shape` may be a dict, e.g. {"state": ..., "privileged_state": ...}.
+        - If `linear_decay_steps != 0`, sampling uses an exact time-biased distribution
+            (matching the CPU ReplayBuffer implementation in this repo):
+            * `> 0`: newer-biased (prefer recent experiences)
+            * `< 0`: older-biased (prefer old experiences)
+        """
 
-    Notes:
-      - `observation_shape` may be a dict, e.g. {"state": ..., "privileged_state": ...}.
-      - If `linear_decay_steps != 0`, sampling uses an exact time-biased distribution
-        (matching the CPU ReplayBuffer implementation in this repo):
-          * `> 0`: newer-biased (prefer recent experiences)
-          * `< 0`: older-biased (prefer old experiences)
-    """
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        if n_envs <= 0:
+            raise ValueError("n_envs must be positive")
 
-    if capacity <= 0:
-        raise ValueError("capacity must be positive")
-    if n_envs <= 0:
-        raise ValueError("n_envs must be positive")
+        buffer_size = max(int(capacity) // int(n_envs), 1)
 
-    buffer_size = max(int(capacity) // int(n_envs), 1)
+        def zeros_obs(shape_spec: tuple[int, ...]) -> jax.Array:
+            return jnp.zeros((buffer_size, n_envs, *shape_spec), dtype=obs_dtype)
 
-    def zeros_obs(shape_spec: tuple[int, ...]) -> jax.Array:
-        return jnp.zeros((buffer_size, n_envs, *shape_spec), dtype=obs_dtype)
+        if isinstance(observation_shape, dict):
+            observations = {k: zeros_obs(v) for k, v in observation_shape.items()}
+            next_observations = {k: zeros_obs(v)
+                                for k, v in observation_shape.items()}
+        elif isinstance(observation_shape, tuple):
+            observations = zeros_obs(observation_shape)
+            next_observations = zeros_obs(observation_shape)
+        elif isinstance(observation_shape, int):
+            observation_shape = (observation_shape,)
+            observations = zeros_obs(observation_shape)
+            next_observations = zeros_obs(observation_shape)
+        else:
+            raise TypeError(
+                f"expected obs_dim to be int|tuple|dict, got {type(observation_shape)}")
 
-    if isinstance(observation_shape, dict):
-        observations = {k: zeros_obs(v) for k, v in observation_shape.items()}
-        next_observations = {k: zeros_obs(v)
-                             for k, v in observation_shape.items()}
-    elif isinstance(observation_shape, tuple):
-        observations = zeros_obs(observation_shape)
-        next_observations = zeros_obs(observation_shape)
-    elif isinstance(observation_shape, int):
-        observation_shape = (observation_shape,)
-        observations = zeros_obs(observation_shape)
-        next_observations = zeros_obs(observation_shape)
-    else:
-        raise TypeError(
-            f"expected obs_dim to be int|tuple|dict, got {type(observation_shape)}")
+        actions = jnp.zeros(
+            (buffer_size, n_envs, *action_shape), dtype=action_dtype)
+        rewards = jnp.zeros((buffer_size, n_envs), dtype=jnp.float32)
+        dones = jnp.zeros((buffer_size, n_envs), dtype=jnp.float32)
 
-    actions = jnp.zeros(
-        (buffer_size, n_envs, *action_shape), dtype=action_dtype)
-    rewards = jnp.zeros((buffer_size, n_envs), dtype=jnp.float32)
-    dones = jnp.zeros((buffer_size, n_envs), dtype=jnp.float32)
+        ptr = jnp.array(0, dtype=jnp.int32)
+        size = jnp.array(0, dtype=jnp.int32)
+        timestamps = jnp.zeros((buffer_size,), dtype=jnp.int32)
+        current_time = jnp.array(0, dtype=jnp.int32)
 
-    ptr = jnp.array(0, dtype=jnp.int32)
-    size = jnp.array(0, dtype=jnp.int32)
-    timestamps = jnp.zeros((buffer_size,), dtype=jnp.int32)
-    current_time = jnp.array(0, dtype=jnp.int32)
-
-    return ReplayBufferState(
-        observations=observations,
-        actions=actions,
-        rewards=rewards,
-        dones=dones,
-        next_observations=next_observations,
-        ptr=ptr,
-        size=size,
-        timestamps=timestamps,
-        current_time=current_time,
-        buffer_size=buffer_size,
-        n_envs=n_envs,
-        obs_shape=observation_shape,
-        action_shape=action_shape,
-        obs_dtype=obs_dtype,
-        action_dtype=action_dtype,
-        raw_linear_decay_steps=int(linear_decay_steps),
-        linear_decay_steps=abs(int(linear_decay_steps)),
-        min_weight=float(min_weight),
-    )
-
-
-def _reshape_obs_leaf(x: Any, shape_spec: tuple[int, ...], n_envs: int, dtype: jnp.dtype) -> jax.Array:
-    x = jnp.asarray(x, dtype=dtype)
-    return x.reshape((n_envs, *shape_spec))
-
-
-def _reshape_action(x: Any, shape_spec: tuple[int, ...], n_envs: int, dtype: jnp.dtype) -> jax.Array:
-    x = jnp.asarray(x, dtype=dtype)
-    return x.reshape((n_envs, *shape_spec))
-
-
-def _reshape_scalar_vec(x: Any, n_envs: int, dtype: jnp.dtype) -> jax.Array:
-    x = jnp.asarray(x, dtype=dtype)
-    return x.reshape((n_envs,))
-
-
-def add(
-    state: ReplayBufferState,
-    obs: ObsTree | np.ndarray,
-    action: jax.Array | np.ndarray,
-    reward: jax.Array | np.ndarray,
-    next_obs: ObsTree | np.ndarray,
-    done: jax.Array | np.ndarray,
-) -> ReplayBufferState:
-    """Add one transition for each env (vectorized) in a JIT-compatible way."""
-    if isinstance(state.obs_shape, dict):
-        assert isinstance(obs, dict) and isinstance(next_obs, dict), (
-            "When observation_shape is a dict, obs and next_obs must be dicts with matching keys."
-        )
-        obs_arr = {
-            k: _reshape_obs_leaf(obs[k], shape_spec,
-                                 state.n_envs, state.obs_dtype)
-            for k, shape_spec in state.obs_shape.items()
-        }
-        next_obs_arr = {
-            k: _reshape_obs_leaf(
-                next_obs[k], shape_spec, state.n_envs, state.obs_dtype)
-            for k, shape_spec in state.obs_shape.items()
-        }
-        new_observations = {k: state.observations[k].at[state.ptr].set(
-            v) for k, v in obs_arr.items()}
-        new_next_observations = {
-            k: state.next_observations[k].at[state.ptr].set(v) for k, v in next_obs_arr.items()
-        }
-    else:
-        assert not isinstance(obs, dict) and not isinstance(next_obs, dict), (
-            "When observation_shape is a tuple, obs and next_obs must be arrays."
-        )
-        obs_arr = _reshape_obs_leaf(
-            obs, state.obs_shape, state.n_envs, state.obs_dtype)
-        next_obs_arr = _reshape_obs_leaf(
-            next_obs, state.obs_shape, state.n_envs, state.obs_dtype)
-        new_observations = state.observations.at[state.ptr].set(obs_arr)
-        new_next_observations = state.next_observations.at[state.ptr].set(
-            next_obs_arr)
-
-    action_arr = _reshape_action(
-        action, state.action_shape, state.n_envs, state.action_dtype)
-    reward_arr = _reshape_scalar_vec(reward, state.n_envs, jnp.float32)
-    done_arr = _reshape_scalar_vec(done, state.n_envs, jnp.float32)
-
-    new_actions = state.actions.at[state.ptr].set(action_arr)
-    new_rewards = state.rewards.at[state.ptr].set(reward_arr)
-    new_dones = state.dones.at[state.ptr].set(done_arr)
-
-    bias_enabled = state.raw_linear_decay_steps != 0
-    new_timestamps = jax.lax.cond(
-        bias_enabled,
-        lambda ts: ts.timestamps.at[ts.ptr].set(ts.current_time),
-        lambda ts: ts.timestamps,
-        state,
-    )
-    new_current_time = jax.lax.cond(
-        bias_enabled,
-        lambda ts: ts.current_time + jnp.array(1, dtype=ts.current_time.dtype),
-        lambda ts: ts.current_time,
-        state,
-    )
-
-    new_ptr = (state.ptr + 1) % state.buffer_size
-    new_size = jnp.minimum(state.size + 1, state.buffer_size)
-
-    return state.replace(
-        observations=new_observations,
-        actions=new_actions,
-        rewards=new_rewards,
-        dones=new_dones,
-        next_observations=new_next_observations,
-        ptr=new_ptr,
-        size=new_size,
-        timestamps=new_timestamps,
-        current_time=new_current_time,
-    )
-
-
-def _gather_time_env(x: jax.Array, time_idx: jax.Array, env_idx: jax.Array) -> jax.Array:
-    return x[time_idx, env_idx]
-
-
-def sample(
-    state: ReplayBufferState,
-    key: jax.Array,
-    batch_size: int
-) -> Batch:
-    """Sample a batch of 1-step transitions.
-
-    Args:
-      state: replay buffer state
-      key: PRNGKey
-      batch_size: number of transitions
-    """
-
-    max_t = jnp.maximum(state.size, 1)
-    key_t, key_e = jax.random.split(key, 2)
-
-    def _uniform_time_idx():
-        return jax.random.randint(key_t, (batch_size,), 0, max_t)
-
-    def _biased_time_idx():
-        def _do_biased():
-            # Compute weights over [0, size). Mask invalid entries to 0 probability.
-            idx = jnp.arange(state.buffer_size, dtype=jnp.int32)
-            valid = idx < state.size
-            age = (state.current_time - state.timestamps).astype(jnp.float32)
-
-            # - newer-biased (raw > 0): w = max(min_weight, 1 - age/decay)
-            # - older-biased (raw < 0): w = min(1, min_weight + age/decay)
-            decay = jnp.array(state.linear_decay_steps, dtype=jnp.float32)
-            decay = jnp.maximum(decay, 1.0)
-            min_w = jnp.array(state.min_weight, dtype=jnp.float32)
-
-            newer = jnp.maximum(min_w, 1.0 - age / decay)
-            older = jnp.minimum(1.0, min_w + age / decay)
-            w = jnp.where(state.raw_linear_decay_steps > 0, newer, older)
-            w = jnp.where(valid, w, 0.0)
-
-            wsum = jnp.sum(w)
-            # If weights sum to zero (shouldn't happen with sane configs), fall back to uniform.
-            denom = jnp.maximum(jnp.sum(valid), 1)
-            p = jnp.where(wsum > 0.0, w / wsum, valid.astype(jnp.float32) / denom)
-            return jax.random.choice(key_t, state.buffer_size, shape=(batch_size,), p=p)
-
-        # If the buffer is empty, return zeros (caller should normally avoid sampling then).
-        return jax.lax.cond(
-            state.size > 0,
-            lambda _: _do_biased(),
-            lambda _: jnp.zeros((batch_size,), dtype=jnp.int32),
-            operand=jnp.int32(0),
+        return cls(
+            observations=observations,
+            actions=actions,
+            rewards=rewards,
+            dones=dones,
+            next_observations=next_observations,
+            ptr=ptr,
+            size=size,
+            timestamps=timestamps,
+            current_time=current_time,
+            buffer_size=buffer_size,
+            n_envs=n_envs,
+            obs_shape=observation_shape,
+            action_shape=action_shape,
+            obs_dtype=obs_dtype,
+            action_dtype=action_dtype,
+            raw_linear_decay_steps=int(linear_decay_steps),
+            linear_decay_steps=abs(int(linear_decay_steps)),
+            min_weight=float(min_weight),
         )
 
-    time_idx = jax.lax.cond(
-        state.raw_linear_decay_steps == 0,
-        lambda _: _uniform_time_idx(),
-        lambda _: _biased_time_idx(),
-        operand=jnp.int32(0),
-    )
-    env_idx = jax.random.randint(key_e, (batch_size,), 0, state.n_envs)
+    @jax.jit
+    def add(
+            self,
+            obs: ObsTree | np.ndarray,
+            action: jax.Array | np.ndarray,
+            reward: jax.Array | np.ndarray,
+            next_obs: ObsTree | np.ndarray,
+            done: jax.Array | np.ndarray,
+    ) -> 'JAXReplayBuffer':
+        """Add one transition for each env (vectorized) in a JIT-compatible way."""
+        if isinstance(self.obs_shape, dict):
+            assert isinstance(obs, dict) and isinstance(next_obs, dict), (
+                "When observation_shape is a dict, obs and next_obs must be dicts with matching keys."
+            )
+            obs_arr = {
+                k: _reshape_obs_leaf(obs[k], shape_spec,
+                                    self.n_envs, self.obs_dtype)
+                for k, shape_spec in self.obs_shape.items()
+            }
+            next_obs_arr = {
+                k: _reshape_obs_leaf(
+                    next_obs[k], shape_spec, self.n_envs, self.obs_dtype)
+                for k, shape_spec in self.obs_shape.items()
+            }
+            new_observations = {k: self.observations[k].at[self.ptr].set(
+                v) for k, v in obs_arr.items()}
+            new_next_observations = {
+                k: self.next_observations[k].at[self.ptr].set(v) for k, v in next_obs_arr.items()
+            }
+        else:
+            assert not isinstance(obs, dict) and not isinstance(next_obs, dict), (
+                "When observation_shape is a tuple, obs and next_obs must be arrays."
+            )
+            obs_arr = _reshape_obs_leaf(
+                obs, self.obs_shape, self.n_envs, self.obs_dtype)
+            next_obs_arr = _reshape_obs_leaf(
+                next_obs, self.obs_shape, self.n_envs, self.obs_dtype)
+            new_observations = self.observations.at[self.ptr].set(obs_arr)
+            new_next_observations = self.next_observations.at[self.ptr].set(
+                next_obs_arr)
 
-    if isinstance(state.obs_shape, dict):
-        observations = {k: _gather_time_env(
-            v, time_idx, env_idx) for k, v in state.observations.items()}
-        next_observations = {
-            k: _gather_time_env(v, time_idx, env_idx) for k, v in state.next_observations.items()
-        }
-    else:
-        observations = _gather_time_env(state.observations, time_idx, env_idx)
-        next_observations = _gather_time_env(
-            state.next_observations, time_idx, env_idx)
+        action_arr = _reshape_action(
+            action, self.action_shape, self.n_envs, self.action_dtype)
+        reward_arr = _reshape_scalar_vec(reward, self.n_envs, jnp.float32)
+        done_arr = _reshape_scalar_vec(done, self.n_envs, jnp.float32)
 
-    actions = _gather_time_env(state.actions, time_idx, env_idx)
-    rewards = _gather_time_env(state.rewards, time_idx, env_idx)
-    dones = _gather_time_env(state.dones, time_idx, env_idx)
+        new_actions = self.actions.at[self.ptr].set(action_arr)
+        new_rewards = self.rewards.at[self.ptr].set(reward_arr)
+        new_dones = self.dones.at[self.ptr].set(done_arr)
 
-    return Batch(
-        observations=observations,
-        actions=actions,
-        rewards=rewards[:, None],
-        dones=dones[:, None],
-        next_observations=next_observations,
-    )
+        bias_enabled = self.raw_linear_decay_steps != 0
+        new_timestamps = jax.lax.cond(
+            bias_enabled,
+            lambda ts: ts.timestamps.at[ts.ptr].set(ts.current_time),
+            lambda ts: ts.timestamps,
+            self,
+        )
+        new_current_time = jax.lax.cond(
+            bias_enabled,
+            lambda ts: ts.current_time + jnp.array(1, dtype=ts.current_time.dtype),
+            lambda ts: ts.current_time,
+            self,
+        )
+
+        new_ptr = (self.ptr + 1) % self.buffer_size
+        new_size = jnp.minimum(self.size + 1, self.buffer_size)
+
+        return self.replace(
+            observations=new_observations,
+            actions=new_actions,
+            rewards=new_rewards,
+            dones=new_dones,
+            next_observations=new_next_observations,
+            ptr=new_ptr,
+            size=new_size,
+            timestamps=new_timestamps,
+            current_time=new_current_time,
+        )
+
+    def sample(
+            self,
+            key: jax.Array,
+            batch_size: int
+        ) -> Batch:
+            """Sample a batch of transitions.
+
+            Args:
+            key: PRNGKey
+            batch_size: number of transitions
+            """
+
+            max_t = jnp.maximum(self.size, 1)
+            key_t, key_e = jax.random.split(key, 2)
+
+            def _uniform_time_idx():
+                return jax.random.randint(key_t, (batch_size,), 0, max_t)
+
+            def _biased_time_idx():
+                def _do_biased():
+                    # Compute weights over [0, size). Mask invalid entries to 0 probability.
+                    idx = jnp.arange(self.buffer_size, dtype=jnp.int32)
+                    valid = idx < self.size
+                    age = (self.current_time - self.timestamps).astype(jnp.float32)
+
+                    # - newer-biased (raw > 0): w = max(min_weight, 1 - age/decay)
+                    # - older-biased (raw < 0): w = min(1, min_weight + age/decay)
+                    decay = jnp.array(self.linear_decay_steps, dtype=jnp.float32)
+                    decay = jnp.maximum(decay, 1.0)
+                    min_w = jnp.array(self.min_weight, dtype=jnp.float32)
+                    if self.raw_linear_decay_steps > 0:
+                        w = jnp.maximum(min_w, 1.0 - age / decay)
+                    else:
+                        w = jnp.minimum(1.0, min_w + age / decay)
+
+                    w = jnp.where(valid, w, 0.0)
+
+                    wsum = jnp.sum(w)
+                    # If weights sum to zero (shouldn't happen with sane configs), fall back to uniform.
+                    denom = jnp.maximum(jnp.sum(valid), 1)
+                    p = jnp.where(wsum > 0.0, w / wsum,
+                                valid.astype(jnp.float32) / denom)
+                    return jax.random.choice(key_t, self.buffer_size, shape=(batch_size,), p=p)
+
+                # If the buffer is empty, return zeros (caller should normally avoid sampling then).
+                return jax.lax.cond(
+                    self.size > 0,
+                    lambda _: _do_biased(),
+                    lambda _: jnp.zeros((batch_size,), dtype=jnp.int32),
+                    operand=jnp.int32(0),
+                )
+
+            time_idx = jax.lax.cond(
+                self.raw_linear_decay_steps == 0,
+                lambda _: _uniform_time_idx(),
+                lambda _: _biased_time_idx(),
+                operand=jnp.int32(0),
+            )
+            env_idx = jax.random.randint(key_e, (batch_size,), 0, self.n_envs)
+
+            if isinstance(self.obs_shape, dict):
+                observations = {k: _gather_time_env(
+                    v, time_idx, env_idx) for k, v in self.observations.items()}
+                next_observations = {
+                    k: _gather_time_env(v, time_idx, env_idx) for k, v in self.next_observations.items()
+                }
+            else:
+                observations = _gather_time_env(self.observations, time_idx, env_idx)
+                next_observations = _gather_time_env(
+                    self.next_observations, time_idx, env_idx)
+
+            actions = _gather_time_env(self.actions, time_idx, env_idx)
+            rewards = _gather_time_env(self.rewards, time_idx, env_idx)
+            dones = _gather_time_env(self.dones, time_idx, env_idx)
+
+            return Batch(
+                observations=observations,
+                actions=actions,
+                rewards=rewards[:, None],
+                dones=dones[:, None],
+                next_observations=next_observations,
+            )
+
+
+
+
+
