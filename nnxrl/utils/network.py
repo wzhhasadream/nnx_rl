@@ -46,7 +46,8 @@ class VNetwork(nnx.Module):
                  hidden_dim=(256, 256),
                  activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
                  layer_norm: bool = False,
-                 simba_encoder: bool = False
+                 simba_encoder: bool = False,
+                 n_head: int = 1    # for distributional q
                  ):
         self.obs_dim = flattened_dim(obs_dim)
         if simba_encoder:
@@ -58,7 +59,7 @@ class VNetwork(nnx.Module):
                            rngs=rngs, layer_norm=layer_norm, activation_fn=activation_fn)
             out_dim = hidden_dim[-1]
         self.out = nnx.Linear(
-            out_dim, 1, rngs=rngs, kernel_init=orthogonal())
+            out_dim, n_head, rngs=rngs, kernel_init=orthogonal())
 
     def __call__(self, x):
         h = self.mlp(x)
