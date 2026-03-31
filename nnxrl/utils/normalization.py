@@ -18,6 +18,7 @@ class RMS:
     mean: jax.Array
     var: jax.Array
     count: jax.Array
+    epsilon: float
 
     @classmethod
     def create(cls, obs_shape: int | Sequence[int], epsilon: float = 1e-4):
@@ -28,6 +29,7 @@ class RMS:
             mean=jnp.zeros(obs_shape, dtype=jnp.float32),
             var=jnp.ones(obs_shape, dtype=jnp.float32),
             count=jnp.array(epsilon, dtype=jnp.float32),
+            epsilon=epsilon
         )
 
     def update(

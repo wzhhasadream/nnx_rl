@@ -44,6 +44,7 @@ class Args:
     grad_step_per_env_step: int = 1
 
 
+
 def make_env(env_id: str, seed: int, action_repeat: int = 1):
     """Create environment."""
     def load_env(env_id):
@@ -65,12 +66,7 @@ def make_env(env_id: str, seed: int, action_repeat: int = 1):
     return thunk
 
 
-def is_dmc_env(env_id: str) -> bool:
-    try:
-        make_env_dmc(env_id, action_repeat=1)
-        return True
-    except Exception:
-        return False
+
 
 
 def main():
@@ -80,13 +76,6 @@ def main():
     activation_fn = jax.nn.mish
 
     args = tyro.cli(Args)
-
-    if is_dmc_env(args.env_id):
-        args.normalize_observation = True
-        args.simba = True
-        args.policy_lr = 1e-4
-        args.q_lr = 1e-4
-        #args.decay_step = 80_000
 
     np.random.seed(args.seed)
     env = [make_env(args.env_id, args.seed + i, args.action_repeat)
@@ -119,10 +108,8 @@ def main():
         simba_encoder=args.simba)
 
 
-    actor_opt = nnx.Optimizer(actor, optax.adamw(
-        args.policy_lr, weight_decay=1e-2)) if args.simba else nnx.Optimizer(actor, optax.adam(args.policy_lr))
-    critic_opt = nnx.Optimizer(critic, optax.adamw(
-        args.q_lr, weight_decay=1e-2)) if args.simba else nnx.Optimizer(critic, optax.adam(args.q_lr))
+    actor_opt = nnx.Optimizer(actor, optax.adam(args.policy_lr))
+    critic_opt = nnx.Optimizer(critic, optax.adam(args.q_lr))
 
     rb = ReplayBuffer(
         envs.single_observation_space,

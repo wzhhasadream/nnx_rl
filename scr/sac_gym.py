@@ -17,7 +17,7 @@ import dataclasses
 
 @dataclasses.dataclass
 class Args:
-    env_id: str = "Ant-v4"
+    env_id: str = "humanoid-run"
     seed: int = 0
     num_envs: int = 1
     total_timesteps: int = int(1e6)
@@ -65,13 +65,6 @@ def make_env(env_id: str, seed: int, action_repeat: int = 1):
     return thunk
 
 
-def is_dmc_env(env_id: str) -> bool:
-    try:
-        make_env_dmc(env_id, action_repeat=1)
-        return True
-    except Exception:
-        return False
-
 
 def main():
     print("🚀 sac training")
@@ -80,16 +73,10 @@ def main():
     activation_fn = jax.nn.mish
 
     args = tyro.cli(Args)
-    if is_dmc_env(args.env_id):
-        args.normalize_observation = True
-        args.simba = True
-        args.policy_lr = 1e-4
-        args.q_lr = 1e-4
-        #args.decay_step = 80_000
 
     np.random.seed(args.seed)
-    env = [make_env(args.env_id, args.seed + i, args.action_repeat)
-           for i in range(args.num_envs)]
+    env = [make_env(args.env_id, args.seed + i, args.action_repeat) for i in range(args.num_envs)]
+
     envs = gym.vector.SyncVectorEnv(env, autoreset_mode='SameStep')
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
 
@@ -117,8 +104,8 @@ def main():
         simba_encoder=args.simba
     )
     alpha = Alpha() if args.autotune else None
-    actor_opt = nnx.Optimizer(actor, optax.adamw(args.policy_lr, weight_decay=1e-2)) if args.simba else nnx.Optimizer(actor, optax.adam(args.policy_lr))
-    critic_opt = nnx.Optimizer(critic, optax.adamw(args.q_lr, weight_decay=1e-2)) if args.simba else nnx.Optimizer(critic, optax.adam(args.q_lr))
+    actor_opt = nnx.Optimizer(actor, optax.adam(args.policy_lr))
+    critic_opt = nnx.Optimizer(critic, optax.adam(args.q_lr))
     alpha_opt = nnx.Optimizer(alpha, optax.adam(args.policy_lr)) if args.autotune else None
 
     rb = ReplayBuffer(
