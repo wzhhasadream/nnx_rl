@@ -10,6 +10,7 @@ from .policy import (
     TanhDeterministicPolicy,
     GaussianPolicy,
     flattened_dim,
+    squash_log_std_tanh,
 )
 
 class QNetwork(nnx.Module):
@@ -337,3 +338,16 @@ class Alpha(nnx.Module):
 
     def __call__(self) -> jax.Array:
         return jnp.exp(self.log_alpha.value)
+
+
+
+class SquashedAlpha(nnx.Module):
+    def __init__(self, init_value: float = 0.0, log_std_min: float = -10.0, log_std_max: float = 7.5):
+        self.log_alpha = nnx.Param(jnp.asarray(init_value))
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+
+    def __call__(self) -> jax.Array:
+        log_alpha = self.log_alpha.value
+        log_alpha = squash_log_std_tanh(log_alpha, log_std_min=self.log_std_min, log_std_max=self.log_std_max)
+        return jnp.exp(log_alpha)

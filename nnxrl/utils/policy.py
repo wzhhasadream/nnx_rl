@@ -118,6 +118,19 @@ def squash_tanh_action(pre_action: jax.Array, pre_log_prob: jax.Array, action_lo
         log_prob = log_prob[:, None]
     return action, log_prob
 
+
+def diagonal_gaussian_kl(mu_c: jax.Array, std_c: jax.Array, mu_o: jax.Array, std_o: jax.Array) -> jax.Array:
+    kl = (
+        jnp.log(std_c / std_o)
+        + (std_o ** 2 + (mu_o - mu_c) ** 2) / (2.0 * std_c ** 2)
+        - 0.5
+    )
+    return kl.sum(axis=-1)
+
+
+
+
+
     
 def mask_logits(
     logits: jax.Array,

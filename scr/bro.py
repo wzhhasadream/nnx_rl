@@ -1,0 +1,217 @@
+import nnxrl.utils.logger as wandb
+from flax import nnx
+from typing import Literal, Sequence
+from nnxrl.utils.replaybuffer import ReplayBuffer
+from nnxrl.agents.bro import update_bro, TrainState
+from nnxrl.utils.normalization import RMS
+from nnxrl.utils.network import EnsembleCritic, GaussianActor, Alpha, SquashedAlpha
+from nnxrl.utils.dmc_wrapper import make_env_dmc
+import time
+import numpy as np
+import jax.numpy as jnp
+import jax
+import optax
+import tyro
+import gymnasium as gym
+import dataclasses
+import copy
+
+
+@dataclasses.dataclass
+class Args:
+    env_id: str = "Ant-v4"
+    seed: int = 0
+    num_envs: int = 1
+    total_timesteps: int = int(1e6)
+    buffer_size: int = int(1e6)
+    learning_starts: int = int(5e3)
+    gamma: float = 0.99
+    tau: float = 0.005
+    batch_size: int = 256
+    policy_lr: float = 3e-4
+    q_lr: float = 3e-4
+    hidden_dim: Sequence[int] = (256, 256)
+    num_q: int = 2
+    num_quantile: int = 100
+    kappa: float = 1.0
+    dist_q: Literal[True, False] = True
+    target_kl: float = 0.05
+    target_entropy: float = 0.0
+    pessimism: float = 0.0
+
+    action_repeat: int = 2
+    normalize_observation: Literal[True, False] = False
+    simba: Literal[True, False] = False
+    decay_step: int = 0
+    grad_step_per_env_step: int = 2
+
+
+def make_env(env_id: str, seed: int, action_repeat: int = 1):
+    """Create environment."""
+    def load_env(env_id):
+        try:
+            # MUJOCO env id examples: "Ant-v5", "Humanoid-v5", ...
+            env = gym.make(env_id)
+        except Exception:
+            # DMC env id examples: "humanoid-run", "humanoid-stand", ...
+            env = make_env_dmc(env_id, action_repeat)
+        return env
+
+    def thunk():
+        env = load_env(env_id)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        if hasattr(env, 'seed'):
+            env.seed(seed)
+        return env
+    return thunk
+
+
+def main():
+    print("🚀 td3 training")
+    print("=" * 60)
+
+    activation_fn = jax.nn.mish
+
+    args = tyro.cli(Args)
+
+    np.random.seed(args.seed)
+    env = [make_env(args.env_id, args.seed + i, args.action_repeat)
+           for i in range(args.num_envs)]
+    envs = gym.vector.SyncVectorEnv(env, autoreset_mode='SameStep')
+    envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
+    action_dim = int(np.prod(np.asarray(envs.single_action_space.shape)))
+    args.target_entropy = - action_dim
+    obs_dim = int(np.prod(np.asarray(envs.single_observation_space.shape)))
+
+    wandb.init(project='bro', config=vars(args),
+               name=f'{args.env_id}//decay_step_{args.decay_step}')
+
+    rngs = nnx.Rngs(args.seed)
+    actor = GaussianActor(
+        obs_dim,
+        action_dim,
+        rngs.fork(),
+        hidden_dim=args.hidden_dim,
+        action_high=envs.single_action_space.high,
+        action_low=envs.single_action_space.low,
+        activation_fn=activation_fn,
+        simba_encoder=args.simba,
+        log_std_min=-10,
+        log_std_max=2,
+        squash_log_std=True)
+
+    alpha = Alpha()
+    optimism_alpha = SquashedAlpha()
+    kl_alpha = SquashedAlpha()
+
+    alpha_opt = nnx.Optimizer(alpha, optax.adam(args.policy_lr))
+    optimism_alpha_opt = nnx.Optimizer(optimism_alpha, optax.adam(args.policy_lr))
+    kl_alpha_opt = nnx.Optimizer(kl_alpha, optax.adam(args.policy_lr))
+
+    critic = EnsembleCritic(
+        obs_dim,
+        action_dim,
+        rngs.fork(split=args.num_q),
+        hidden_dim=args.hidden_dim,
+        activation_fn=activation_fn,
+        simba_encoder=args.simba)
+
+    actor_opt = nnx.Optimizer(actor, optax.adam(args.policy_lr))
+    critic_opt = nnx.Optimizer(critic, optax.adam(args.q_lr))
+    optimism_actor = copy.deepcopy(actor)
+    optimism_actor_opt = nnx.Optimizer(optimism_actor, optax.adam(args.policy_lr))
+
+    rb = ReplayBuffer(
+        envs.single_observation_space,
+        envs.single_action_space,
+        args.buffer_size,
+        n_envs=args.num_envs,
+        linear_decay_steps=args.decay_step
+    )
+    if args.normalize_observation:
+        rms = RMS.create(envs.single_observation_space.shape)
+    else:
+        rms = None
+    train_state = TrainState.create(actor=actor, critic=critic, actor_opt=actor_opt, critic_opt=critic_opt, optimism_actor=optimism_actor, optimism_actor_opt=optimism_actor_opt,
+                                    rms=rms, entropy_coef=alpha, optimism_coef=optimism_alpha, kl_coef=kl_alpha, entropy_coef_opt=alpha_opt, optimism_coef_opt=optimism_alpha_opt, kl_coef_opt=kl_alpha_opt)
+    start_time = time.time()
+
+    @nnx.jit
+    def get_action(actor_optimism, rms, obs, key):
+        if args.normalize_observation:
+            obs_for_policy, rms = rms.normalize(obs, rms)
+        else:
+            obs_for_policy = obs
+        actions, _, _ = actor_optimism.get_action(obs_for_policy, key=key)
+        return rms, actions
+
+    jit_update = nnx.jit(lambda ts, big_batch, key: update_bro(
+        ts, args, big_batch, key), donate_argnums=0)
+
+    obs, _ = envs.reset(seed=args.seed)
+    step_key, update_key = jax.random.split(jax.random.PRNGKey(args.seed), 2)
+
+    for global_step in range(1, args.total_timesteps + 1):
+        if global_step < args.learning_starts:
+            actions = np.array([envs.single_action_space.sample()
+                               for _ in range(args.num_envs)])
+        else:
+            rms, actions = get_action(
+                train_state.optimism_actor, train_state.rms, obs, jax.random.fold_in(step_key, global_step))
+            train_state = train_state.replace(rms=rms)
+            actions = np.asarray(actions)
+
+        next_obs, rewards, terminations, truncations, infos = envs.step(
+            actions)
+
+        if terminations.any() or truncations.any():
+            done = np.logical_or(terminations, truncations)
+
+            episode_return = infos["episode"]['r'][done].mean()
+            episode_length = infos["episode"]['l'][done].mean()
+            current_time = time.time()
+            total_time = current_time - start_time
+            avg_speed = (global_step) / \
+                total_time if total_time > 0 else 0
+
+            print(f"🎉 Step {global_step:,}: Episode return {episode_return:.1f} (length: {episode_length}) "
+                  f"⚡ {avg_speed:.1f} steps/s")
+
+            wandb.log({
+                "episode_return": episode_return,
+                "episode_length": episode_length,
+                "wall_time": total_time
+            }, global_step, commit=False)
+
+        real_next_obs = next_obs.copy()
+        for idx, trunc in enumerate(truncations):
+            if trunc:
+                real_next_obs[idx] = infos["final_obs"][idx]
+
+        rb.add(
+            obs,
+            actions,
+            rewards,
+            real_next_obs,
+            terminations,
+        )
+
+        if global_step >= args.learning_starts:
+            big_batch = rb.sample(
+                args.batch_size * args.grad_step_per_env_step)
+            train_state, info = jit_update(
+                train_state, big_batch, jax.random.fold_in(
+                    update_key, global_step)
+            )
+            if global_step % 999 == 0:
+                wandb.log(info, global_step)
+
+        obs = next_obs
+
+    envs.close()
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    main()
