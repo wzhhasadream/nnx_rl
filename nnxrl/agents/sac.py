@@ -129,7 +129,7 @@ def update_critic(ts: TrainState, config: SACConfig, batch: Batch, key: jax.Arra
     def dist_critic_loss(critic, target_critic, actor):
             next_actions, next_log_pi = actor.get_action(batch.next_observations, key=key)
             next_q_dist = target_critic(batch.next_observations, next_actions)  # (2, B, num_quantile)
-            next_q_dist = next_q_dist.max(0)
+            next_q_dist = next_q_dist.min(0)
             target_q_dist = batch.rewards + config.gamma * (1 - batch.dones) * (next_q_dist - alpha_value * next_log_pi)  # (B, num_quantile)
             q_dist = critic(batch.observations, batch.actions)  # (2, B, num_quantile)
 
@@ -170,7 +170,7 @@ def update_actor(
             min_q = jnp.min(q, axis=0)
         elif config.num_head > 1:
             q_dist = critic_model(batch.observations, actions)
-            min_q = jnp.max(q_dist, axis=0).mean(-1, keepdims=True)           
+            min_q = jnp.min(q_dist, axis=0).mean(-1, keepdims=True)           
         actor_loss = -jnp.mean(min_q - alpha_value * log_pi)
         return actor_loss, {"training/actor_loss": actor_loss}
 
