@@ -3,16 +3,15 @@ import jax.numpy as jnp
 from flax import nnx
 import flax.struct as struct
 from copy import deepcopy
-from mujoco_playground import MjxEnv
 from typing import Callable, Protocol
-from ..utils.network import (
+from ..model import (
 SquashedTanhGaussianActor, 
 Alpha,
 EnsembleCritic,
-soft_update)
-from ..utils.replaybuffer import Batch, JAXReplayBuffer, ReplayBuffer
+soft_update,
+quantile_loss)
+from ..utils.replaybuffer import Batch, JAXReplayBuffer
 from ..utils.normalization import RMS
-from ..utils.evaluate import evaluate_policy
 from ..utils.checkpoint import load_states, save_states
 
 
@@ -22,6 +21,7 @@ class SACConfig(Protocol):
     num_envs: int
     learning_starts: int
     num_evals: int
+    num_head: int
 
     gamma: float
     tau: float
@@ -107,19 +107,18 @@ class TrainState:
 
     
 
-def update_critic(train_state: TrainState, config: SACConfig, batch: Batch, key: jax.Array):
-    next_actions, next_log_pi = train_state.actor.get_action(
-        batch.next_observations, key=key)
-    next_q = train_state.target_critic(batch.next_observations, next_actions)
-    min_next_q = jnp.min(next_q, axis=0)
-    alpha_value = train_state.alpha() if config.autotune else config.alpha
-    target_q = batch.rewards + (1.0 - batch.dones) * config.gamma * (
-        min_next_q - alpha_value * next_log_pi
-    )
-    target_q = jax.lax.stop_gradient(target_q)
-
-    def critic_loss_fn(critic_model: EnsembleCritic):
-        q = critic_model(batch.observations, batch.actions)
+def update_critic(ts: TrainState, config: SACConfig, batch: Batch, key: jax.Array):
+    alpha_value = ts.alpha() if config.autotune else config.alpha
+    def critic_loss_fn(critic: EnsembleCritic, target_critic: EnsembleCritic, actor: SquashedTanhGaussianActor):
+        q = critic(batch.observations, batch.actions)
+        next_actions, next_log_pi = actor.get_action(
+            batch.next_observations, key=key)
+        next_q = target_critic(batch.next_observations, next_actions)
+        min_next_q = jnp.min(next_q, axis=0)
+        target_q = batch.rewards + (1.0 - batch.dones) * config.gamma * (
+            min_next_q - alpha_value * next_log_pi
+        )
+        target_q = jax.lax.stop_gradient(target_q)
         critic_loss = jnp.mean((q - target_q) ** 2)
         info = {
             "training/q_loss": critic_loss,
@@ -127,10 +126,30 @@ def update_critic(train_state: TrainState, config: SACConfig, batch: Batch, key:
         }
         return critic_loss, info
 
+    def dist_critic_loss(critic, target_critic, actor):
+            next_actions, next_log_pi = actor.get_action(batch.next_observations, key=key)
+            next_q_dist = target_critic(batch.next_observations, next_actions)  # (2, B, num_quantile)
+            next_q_dist = next_q_dist.max(0)
+            target_q_dist = batch.rewards + config.gamma * (1 - batch.dones) * (next_q_dist - alpha_value * next_log_pi)  # (B, num_quantile)
+            q_dist = critic(batch.observations, batch.actions)  # (2, B, num_quantile)
+
+            q_loss = quantile_loss(q_dist, target_q_dist).mean()
+
+            return q_loss, {
+            "training/q_loss": q_loss,
+            "training/q_mean": q_dist.mean(),
+            }
+
+    if  config.num_head > 1:
+        loss = dist_critic_loss
+    elif config.num_head == 1:
+        loss = critic_loss_fn
+    
+
     (_loss, info), grads = nnx.value_and_grad(
-        critic_loss_fn, has_aux=True)(train_state.critic)
-    train_state.critic_opt.update(grads)
-    return train_state, info
+        loss, has_aux=True)(ts.critic, ts.target_critic, ts.actor)
+    ts.critic_opt.update(grads)
+    return ts, info
 
 
 
@@ -146,8 +165,12 @@ def update_actor(
 
     def actor_loss_fn(actor_model: SquashedTanhGaussianActor, critic_model: EnsembleCritic):
         actions, log_pi = actor_model.get_action(batch.observations, key=key)
-        q = critic_model(batch.observations, actions)
-        min_q = jnp.min(q, axis=0)
+        if config.num_head == 1:
+            q = critic_model(batch.observations, actions)
+            min_q = jnp.min(q, axis=0)
+        elif config.num_head > 1:
+            q_dist = critic_model(batch.observations, actions)
+            min_q = jnp.max(q_dist, axis=0).mean(-1, keepdims=True)           
         actor_loss = -jnp.mean(min_q - alpha_value * log_pi)
         return actor_loss, {"training/actor_loss": actor_loss}
 
@@ -271,7 +294,6 @@ def sample_and_update_sac(
     rb: JAXReplayBuffer
 ) -> tuple[TrainState, dict[str, jax.Array]]:
     """(multiple SGD steps per env step)."""
-    assert train_state.rb is not None, "Replay buffer state must be initialized"
     sample_key, update_key = jax.random.split(key, 2)
 
     # 1) sample one big batch, then reshape to (grad_step_per_env_step, batch_size, ...)
@@ -283,98 +305,7 @@ def sample_and_update_sac(
 
     return ts, info
 
-#####################################################################
-################## JAX ENV ##########################################
-#####################################################################
 
 
 
 
-def make_train(envs: MjxEnv, config: SACConfig, train_log_fn: Callable):
-    def train(train_state: TrainState):
-        key = jax.random.PRNGKey(config.seed)
-        env_key, train_key = jax.random.split(key, 2)
-        state = envs.reset(jax.random.split(env_key, config.num_envs))
-        num_env_step = config.total_timesteps // config.num_envs
-        eval_indices = jnp.floor(
-            jnp.linspace(1, num_env_step, config.num_evals)
-        ).astype(jnp.int32)
-
-        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry))
-        def step(
-            carry, step_idx
-        ):
-            state, train_state = carry
-            if config.normalize_observation and train_state.rms is not None:
-                obs_for_policy, new_rms = rms_normalize(state.obs, train_state.rms)
-                train_state = train_state.replace(rms=new_rms)
-            else:
-                obs_for_policy = state.obs
-            action_key, update_key, eval_key = jax.random.split(jax.random.fold_in(train_key, step_idx), 3)
-            actions = nnx.cond(
-                step_idx * config.num_envs < config.learning_starts,
-                lambda ts: jax.random.uniform(
-                    action_key,
-                    (config.num_envs, envs.action_size),
-                    minval=ts.actor.action_low,
-                    maxval=ts.actor.action_high,
-                ),
-                lambda ts: ts.actor.get_action(obs_for_policy, action_key)[0],
-                train_state
-            )
-            
-            next_state = envs.step(state, actions)
-            terminated = jnp.logical_and(
-                next_state.done.astype(bool),
-                jnp.logical_not(next_state.info["truncation"].astype(bool)),
-            )
-            buffer_state = add(
-                train_state.rb,
-                state.obs,
-                actions,
-                next_state.reward,
-                next_state.info["true_obs"],
-                terminated
-            )
-            train_state = train_state.replace(rb=buffer_state)
-
-            should_log = jnp.any(eval_indices == step_idx)
-
-            def _train_sac(train_state, key):
-                ts, info = sample_and_update_sac(train_state, config, key)
-                nnx.cond(
-                    should_log,
-                    lambda: jax.debug.callback(
-                        train_log_fn, info, step_idx * config.num_envs),
-                    lambda: None
-                )
-                return ts
-
-            train_state = nnx.cond(
-                step_idx * config.num_envs >= config.learning_starts,
-                lambda args: _train_sac(*args),          
-                lambda args: args[0],        
-                (train_state, update_key),
-            )
-
-            def _eval_and_log():
-                eval_metric = evaluate_policy(envs, lambda obs, key: train_state.actor.get_action(obs, key)[0], eval_key, train_state.rms)
-                jax.debug.callback(train_log_fn, eval_metric, step_idx * config.num_envs)
-                return None
-
-
-            nnx.cond(
-                should_log,
-                _eval_and_log,
-                lambda : None
-            )
-
-
-
-
-            return next_state, train_state
-
-        _, final_train_state = step((state, train_state), jnp.arange(1, num_env_step + 1))
-
-        return final_train_state
-    return train
