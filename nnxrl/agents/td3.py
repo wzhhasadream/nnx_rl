@@ -5,9 +5,7 @@ import jax.numpy as jnp
 from flax import nnx, struct
 from ..utils.normalization import RMS
 from ..utils.replaybuffer import Batch, JAXReplayBuffer
-from ..utils.network import TanhDetActor, soft_update, EnsembleCritic
-from mujoco_playground import MjxEnv, State
-from ..utils.evaluate import evaluate_policy
+from ..model import TanhDetActor, soft_update, EnsembleCritic, quantile_loss
 from ..utils.checkpoint import load_states, save_states
 
 
@@ -32,6 +30,7 @@ class TD3Config(Protocol):
 
     policy_noise: float
     noise_clip: float
+    num_head: int
 
 @struct.dataclass
 class TrainState:
@@ -53,7 +52,6 @@ class TrainState:
     critic,
     actor_opt,
     critic_opt,
-    rb=None,
     rms=None):
         target_actor = deepcopy(actor)
         target_critic = deepcopy(critic)
@@ -121,7 +119,7 @@ def _target_policy_smoothing(
 
 
 def update_critic(
-    train_state: TrainState,
+    ts: TrainState,
     config: TD3Config,
     batch: Batch,
     key: jax.Array,
@@ -129,18 +127,17 @@ def update_critic(
     """Update TD3 critics and return the updated TrainState."""
     target_key, _ = jax.random.split(key)
     smoothed_actions = _target_policy_smoothing(
-        train_state.target_actor,
+        ts.target_actor,
         batch.next_observations,
         key=target_key,
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
     )
-    target_q = train_state.target_critic(batch.next_observations, smoothed_actions)    # [num_q, B, 1]
-    min_q = jnp.min(target_q, axis=0)                                                  # [B, 1]
-    target_values = batch.rewards + config.gamma * (1.0 - batch.dones) * min_q
-    target_values = jax.lax.stop_gradient(target_values)
 
-    def critic_loss_fn(critic):
+    def critic_loss_fn(critic, target_critic):
+        target_q = target_critic(batch.next_observations, smoothed_actions)    # [num_q, B, 1]
+        min_q = jnp.min(target_q, axis=0)                                                  # [B, 1]
+        target_values = batch.rewards + config.gamma * (1.0 - batch.dones) * min_q
         q = critic(batch.observations, batch.actions)
         # [num_q, B, 1] - [B, 1]
         q_loss = jnp.mean((q - target_values) ** 2)
@@ -151,11 +148,29 @@ def update_critic(
         }
         return q_loss, info
 
+    def quantile_loss_fn(critic, target_critic):
+        q_dist = critic(batch.observations, batch.actions)    # [num_q, B, num_head]
+        next_q_dist = target_critic(batch.next_observations, smoothed_actions).min(
+            0)   # [B, num_head]
+        target_dist = batch.rewards + config.gamma * (1.0 - batch.dones) * next_q_dist
+
+        q_loss = quantile_loss(q_dist, target_dist).mean()
+
+        info = {
+            "training/critic_loss": q_loss,
+            "training/q_mean": jnp.mean(q_dist),
+        }
+        return q_loss, info
+
+    if config.num_head == 1:
+        loss = critic_loss_fn
+    elif config.num_head > 1:
+        loss = quantile_loss_fn
     (_loss, info), grads = nnx.value_and_grad(
-        critic_loss_fn, has_aux=True
-    )(train_state.critic)
-    train_state.critic_opt.update(grads)
-    return train_state, info
+        loss, has_aux=True
+    )(ts.critic, ts.target_critic )
+    ts.critic_opt.update(grads)
+    return ts, info
 
 
 
@@ -170,7 +185,11 @@ def update_actor(
     """
     def actor_loss_fn(actor, critic):
         actions = actor.get_action(batch.observations)
-        q = critic(batch.observations, actions)[0]
+        if config.num_head == 1:
+            q = critic(batch.observations, actions)[0]
+        elif config.num_head > 1:
+            q_dist = critic(batch.observations, actions)[0]
+            q = q_dist.mean(-1, keepdims=True)
         actor_loss = -jnp.mean(q)
         return actor_loss, {"training/actor_loss": actor_loss}
 
@@ -220,7 +239,7 @@ def update_td3(
 
 
         ts, policy_info = nnx.cond(
-            train_state.grad_updates % config.policy_frequency == 0, 
+            ts.grad_updates % config.policy_frequency == 0, 
             lambda ts: update_actor(ts, batch, config), 
             lambda ts: (ts, {"training/actor_loss": jnp.array(0.0)}),
             ts)
@@ -256,112 +275,7 @@ def sample_and_update_td3(
 ################## JAX ENV ##########################################
 #####################################################################
 
-    
-
-def env_step(train_state: TrainState, config: TD3Config, state: State, envs: MjxEnv, step_idx: jax.Array, key: jax.Array):
-    if config.normalize_observation and train_state.rms is not None:
-        obs_for_policy, new_rms = rms_normalize(state.obs, train_state.rms)
-        train_state = train_state.replace(rms=new_rms)
-    else:
-        obs_for_policy = state.obs
-
-    def _action_with_exploration_noise(ts: TrainState):
-        actions = ts.actor.get_action(obs_for_policy)
-        noise = (
-            jax.random.normal(key, shape=actions.shape)
-            * config.exploration_noise
-            * ts.actor.action_scale
-        )
-        
-        return jnp.clip(noise + actions, min=ts.actor.action_low, max=ts.actor.action_high)
-
-    actions = nnx.cond(
-        step_idx * config.num_envs < config.learning_starts,
-        lambda _: jax.random.uniform(
-            key,
-            shape=(config.num_envs, envs.action_size),
-            minval=train_state.actor.action_low,
-            maxval=train_state.actor.action_high,
-        ),
-        lambda ts: _action_with_exploration_noise(ts),
-        train_state,
-    )
-
-    next_state = envs.step(state, actions)
-    terminated = jnp.logical_and(
-        next_state.done.astype(bool),
-        jnp.logical_not(next_state.info["truncation"].astype(bool)),
-    )
-    new_rb = add(
-        train_state.rb,
-        state.obs,
-        actions,
-        next_state.reward,
-        next_state.info['true_obs'],
-        terminated
-    )
-    train_state = train_state.replace(rb=new_rb)
-
-    return train_state, next_state
 
 
 
 
-
-def make_train(
-    envs: MjxEnv,
-    config: TD3Config,
-    train_log_fn: Callable,
-):
-    def train(train_state: TrainState):
-        key = jax.random.PRNGKey(config.seed)
-        env_key, update_key = jax.random.split(key, 2)
-        init_state = envs.reset(jax.random.split(env_key, config.num_envs))
-
-        num_env_step = config.total_timesteps // config.num_envs
-        eval_indices = jnp.floor(jnp.linspace(1, num_env_step, config.num_evals)).astype(jnp.int32)
-
-        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry))
-        def step(carry, env_step_idx):
-            state, train_state = carry
-            step_key = jax.random.fold_in(update_key, env_step_idx)
-            step_key, train_key, eval_key = jax.random.split(step_key, 3)
-            train_state, next_state = env_step(
-                train_state, config, state, envs, env_step_idx, step_key
-            )
-
-            should_log = jnp.any(eval_indices == env_step_idx)
-
-            def _train_td3(args):
-                ts, key = args
-                ts, info = sample_and_update_td3(ts, config, key)
-                nnx.cond(
-                    should_log,
-                    lambda: jax.debug.callback(train_log_fn, info, env_step_idx * config.num_envs),
-                    lambda: None,
-                )
-                return ts
-
-            train_state = nnx.cond(
-                env_step_idx * config.num_envs >= config.learning_starts,
-                _train_td3,
-                lambda args: args[0],
-                (train_state, train_key),
-            )
-
-            def _eval_and_log():
-                eval_metrics = evaluate_policy(envs, lambda obs, key: train_state.actor.get_action(obs), eval_key, train_state.rms)
-                jax.debug.callback(train_log_fn, eval_metrics, env_step_idx * config.num_envs)
-                return None
-
-            nnx.cond(should_log, _eval_and_log, lambda : None)
-
-            return next_state, train_state
-
-        _, final_train_state = step(
-            (init_state, train_state),
-            jnp.arange(1, num_env_step + 1, dtype=jnp.int32)
-        )
-        return final_train_state
-
-    return train
