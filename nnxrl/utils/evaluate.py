@@ -1,8 +1,5 @@
 from typing import Callable
-import jax
-import jax.numpy as jnp
 import gymnasium
-import jax
 import numpy as np
 
 
@@ -10,9 +7,9 @@ def evaluate_policy(
     env_creater: Callable,
     policy: Callable[[np.ndarray], np.ndarray],
     eval_episodes: int = 100,
-    num_envs: int = 10,
+    num_envs: int = 100,
 ) -> float:
-    envs = gymnasium.vector.SyncVectorEnv([env_creater] * num_envs)
+    envs = gymnasium.vector.AsyncVectorEnv([env_creater] * num_envs)
     envs = gymnasium.wrappers.vector.RecordEpisodeStatistics(envs)
 
     obs, _ = envs.reset()
@@ -47,6 +44,8 @@ def evaluate_playground_policy(
     max_eval_steps: int = 1_000,
     seed: int = 0
 ):
+    import jax
+    import jax.numpy as jnp
     
     num_envs = eval_episodes
     init_state = env.reset(jax.random.split(jax.random.PRNGKey(seed), num_envs))

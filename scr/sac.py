@@ -16,9 +16,9 @@ import dataclasses
 
 @dataclasses.dataclass
 class Args:
-    env_id: str = "h1-run-v0"
+    env_id: str = "Ant-v4"
     env_type: Literal['mujoco', 'myosuite', 'dmc',
-                      'humanoid_bench'] = 'humanoid_bench'
+                      'humanoid_bench'] = 'mujoco'
     seed: int = 1
     num_envs: int = 1
     total_timesteps: int = int(1e6)
@@ -39,7 +39,7 @@ class Args:
     actor_hidden_dim: Sequence[int] = (512, 512, 512)
     actor_ln: Literal[True, False] = True
     num_q: int = 2
-    num_head: int = 100
+    num_head: int = 1
 
 
     action_repeat: int = 2
