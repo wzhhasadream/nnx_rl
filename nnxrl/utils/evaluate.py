@@ -35,7 +35,7 @@ def evaluate_playground_policy(
     env,
     policy,
     num_evals: int = 100,
-    max_eval_steps: int = 1_001,
+    max_eval_steps: int = 1_000,
 ):
     
     num_envs = num_evals
