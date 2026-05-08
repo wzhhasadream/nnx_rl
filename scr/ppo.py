@@ -1,10 +1,11 @@
 
 import jax.numpy as jnp
-from nnxrl.agents.ppo.train import TrainState, ppo_update_from_trajectory, Trajectory
-from nnxrl.agents.ppo.network import ActorCritic
+from nnxrl.agents.ppo import ActorCritic, TrainState, update_ppo, Trajectory
+from nnxrl.utils import RMS
 from flax import nnx
 import jax
-from nnxrl.utils.dmc_wrapper import make_env_dmc
+from nnxrl.env import load_env
+from nnxrl.model import VNetwork, GaussianActor
 import optax
 import numpy as np
 import dataclasses
@@ -18,6 +19,8 @@ import gymnasium as gym
 @dataclasses.dataclass
 class Args:
     env_id: str = 'HalfCheetah-v4'
+    env_type: Literal['mujoco', 'myosuite', 'dmc',
+                      'humanoid_bench'] = 'mujoco'
     seed: int = 1
     num_envs: int = 16
     total_timesteps: int = int(1e6)
@@ -30,37 +33,20 @@ class Args:
     max_grad_norm: float | None = 0.5
     normalize_observation: Literal[True, False] = True
     normalize_advantage: Literal[True, False] = True
-    normalize_reward: Literal[True, False] = True
+    normalize_reward: Literal[True, False] = False
     clip_value: Literal[True, False] = False
     reward_scale: float = 1
     target_kl: float | None = None
     rollout_steps: int = 256  # steps per rollout before update
     num_minibatches: int = 32
     update_epochs: int = 16
-    hidden_dim: Sequence[int] = (256, 256)
+    actor_hidden_dim: Sequence[int] = (256, 256)
+    critic_hidden_dim: Sequence[int] = (256, 256)
+    actor_ln: Literal[True, False] = False
+    critic_ln: Literal[True, False] = False
+    simba: Literal[True, False] = False
     action_repeat: int = 1
 
-
-def make_env(env_id: str, seed: int, action_repeat: int = 2):
-    """Create environment."""
-    def load_env(env_id):
-        try:
-            # MUJOCO env id examples: "Ant-v5", "Humanoid-v5", ...
-            env = gym.make(env_id)
-        except Exception:
-            # DMC env id examples: "humanoid-run", "humanoid-stand", ...
-            env = make_env_dmc(env_id, action_repeat)
-        return env
-
-    def thunk():
-        env = load_env(env_id)
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
-        env = gym.wrappers.ClipAction(env)
-        if hasattr(env, 'seed'):
-            env.seed(seed)
-        return env
-    return thunk
 
 
 
@@ -72,7 +58,7 @@ def main():
     num_rollout = int(args.total_timesteps /
                       (args.rollout_steps * args.num_envs))
     steps_per_rollout = args.num_minibatches * args.update_epochs
-    env = [make_env(args.env_id, args.seed + i, args.action_repeat)
+    env = [load_env(args.env_id, args.env_type, args.action_repeat, args.seed + i, True)
            for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(env)
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
@@ -81,17 +67,36 @@ def main():
 
     if args.normalize_reward:
         envs = gym.wrappers.vector.NormalizeReward(envs, args.gamma)
-              
+    
+    def lr_schedule(step):
+        progress = (step // steps_per_rollout) / max(num_rollout, 1)
+        return args.lr * jnp.maximum(0.0, 1.0 - progress)
+
+    if args.max_grad_norm is not None and args.max_grad_norm > 0:
+        optimizer_chain = optax.chain(
+            optax.clip_by_global_norm(args.max_grad_norm),
+            optax.adam(lr_schedule)
+        )
+    else:
+        optimizer_chain = optax.chain(
+            optax.adam(lr_schedule)
+        )
 
     action_dim = int(np.prod(np.asarray(envs.single_action_space.shape)))
     obs_dim = int(np.prod(np.asarray(envs.single_observation_space.shape)))
 
     wandb.init(project='ppo', config=vars(args), name=f'{args.env_id}')
     rngs = nnx.Rngs(args.seed)
-    agent = ActorCritic(obs_dim, action_dim, rngs, envs.single_observation_space.high, envs.single_observation_space.low, args.hidden_dim)
-    jit_get_action = nnx.jit(lambda agent, obs, key: agent.get_action_and_value(obs, key=key), donate_argnums=0)
+
+    actor = GaussianActor(obs_dim, action_dim, rngs.fork(), args.actor_hidden_dim, action_high=envs.single_action_space.high, action_low=envs.single_action_space.low, layer_norm=args.actor_ln, simba_encoder=args.simba, squash_log_std=False, shared_std=True, activation_fn=jax.nn.relu)
+    v = VNetwork(obs_dim, rngs.fork(), args.critic_hidden_dim, layer_norm=args.critic_ln, simba_encoder=args.simba, activation_fn=jax.nn.relu)
+    agent = ActorCritic(actor, v)
+    opt = nnx.Optimizer(agent, optimizer_chain)
+    ts = TrainState.create(agent, opt)
+    jit_get_action_and_value = nnx.jit(lambda agent, obs, key: (*agent.actor.get_action(obs, key=key), agent.critic(obs)))
+    jit_get_value = nnx.jit(lambda agent, obs: agent.critic(obs))
     jit_update = nnx.jit(
-        lambda ts, traj, key: ppo_update_from_trajectory(ts, traj, args, key), donate_argnums=0)
+        lambda ts, traj, key: update_ppo(ts, traj, args, key), donate_argnums=0)
 
     start_time = time.time()
 
@@ -135,7 +140,8 @@ def main():
 
         # Python loop for environment interaction
         for step_key in keys:
-            actions, log_probs, values, _ = jit_get_action(agent, cur_obs, key=step_key)
+            actions, log_probs, _, values = jit_get_action_and_value(
+                agent, cur_obs, key=step_key)
 
             # Store current step data
             obs_list.append(cur_obs)
@@ -175,14 +181,14 @@ def main():
             cur_dones = next_dones
 
         # Get final value for bootstrap
-        final_value = agent.get_value(cur_obs)
+        final_value = jit_get_value(agent, cur_obs)
         values_list.append(final_value)
 
         # Stack all data
         stacked_obs = jnp.stack(obs_list, axis=0)
         stacked_actions = jnp.stack(actions_list, axis=0)
-        stacked_log_probs = jnp.stack(log_probs_list, axis=0)
-        stacked_values = jnp.stack(values_list, axis=0)
+        stacked_log_probs = jnp.stack(log_probs_list, axis=0).squeeze()
+        stacked_values = jnp.stack(values_list, axis=0).squeeze()
         stacked_rewards = jnp.stack(rewards_list, axis=0)
         stacked_dones = jnp.stack(dones_list, axis=0)
 
@@ -190,32 +196,16 @@ def main():
 
         return (cur_obs, cur_dones, global_step), traj
 
-    def lr_schedule(step):
-        progress = (step // steps_per_rollout) / max(num_rollout, 1)
-        return args.lr * jnp.maximum(0.0, 1.0 - progress)
-
-    if args.max_grad_norm is not None and args.max_grad_norm > 0:
-        optimizer_chain = optax.chain(
-            optax.clip_by_global_norm(args.max_grad_norm),
-            optax.adam(lr_schedule)
-        )
-    else:
-        optimizer_chain = optax.chain(
-            optax.adam(lr_schedule)
-        )
-    optimizer = nnx.Optimizer(agent, optimizer_chain)
-    train_state = TrainState(agent, optimizer)
-
     obs, _ = envs.reset(seed=args.seed)
     dones = jnp.zeros((args.num_envs, ))
     global_step = 0
     rollout_key, update_key = jax.random.split(jax.random.PRNGKey(args.seed))
 
-    for rollout_idx in range(1, num_rollout):
+    for rollout_idx in range(1, num_rollout + 1):
         (next_obs, next_dones, global_step), traj = rollout(
-            train_state.agent, envs, args.rollout_steps, obs, dones, jax.random.fold_in(rollout_key, rollout_idx), global_step)
+            ts.agent, envs, args.rollout_steps, obs, dones, jax.random.fold_in(rollout_key, rollout_idx), global_step)
         
-        train_state, info = jit_update(train_state, traj, jax.random.fold_in(update_key, rollout_idx))
+        ts, info = jit_update(ts, traj, jax.random.fold_in(update_key, rollout_idx))
         if rollout_idx % 10 == 0:
             wandb.log(info, global_step)
         obs = next_obs

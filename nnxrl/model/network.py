@@ -226,7 +226,8 @@ class GaussianActor(nnx.Module):
         simba_encoder: bool = False,
         log_std_min: jax.Array = -20,
         log_std_max: jax.Array = 2,
-        squash_log_std: bool = False
+        squash_log_std: bool = True,
+        shared_std: bool = False
     ):
 
         self.action_high = action_high
@@ -235,6 +236,7 @@ class GaussianActor(nnx.Module):
         self.action_bias = (action_high + action_low) / 2
 
         self.obs_dim = flattened_dim(obs_dim)
+        self.shared_std = shared_std
         if simba_encoder:
             self.encoder = SimBaEncoder(self.obs_dim, 128, 1, rngs)
             out_dim = 128
@@ -244,15 +246,21 @@ class GaussianActor(nnx.Module):
             out_dim = hidden_dim[-1]
         self.fc_mean = nnx.Linear(
             out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
-        self.fc_logstd = nnx.Linear(
+        if not self.shared_std:
+            self.fc_logstd = nnx.Linear(
             out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
+        else:
+            self.log_std = nnx.Param(jnp.zeros((action_dim, )))
 
         self.policy = GaussianPolicy(log_std_min, log_std_max, squash_log_std)
 
     def __call__(self, x: Any) -> Any:
         x = self.encoder(x)
         mean = self.fc_mean(x)
-        log_std = self.fc_logstd(x)
+        if not self.shared_std:
+            log_std = self.fc_logstd(x)
+        else:
+            log_std = jnp.broadcast_to(self.log_std.value, mean.shape)
         return self.policy.dist(mean, log_std)
 
     def get_action(self, x: Any, *, key: jax.Array | None = None, actions: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -265,7 +273,7 @@ class GaussianActor(nnx.Module):
         entropy = action_distribution.entropy()
 
         # (batch_size, action_dim), (batch_size, 1), (batch_size, 1)
-        return jnp.clip(actions, self.action_low, self.action_high), log_prob[:, None], entropy[:, None]
+        return actions, log_prob[:, None], entropy[:, None]
 
     def get_mean_action(self, x: Any) -> jax.Array:
         h = self.encoder(x)
@@ -328,7 +336,6 @@ class FlowActor(nnx.Module):
         actions = jnp.clip(a_i, self.action_low, self.action_high)
 
         return actions
-
 
 
 

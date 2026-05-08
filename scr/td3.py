@@ -1,13 +1,14 @@
 import nnxrl.utils.logger as wandb
 from flax import nnx
-from nnxrl.utils.replaybuffer import ReplayBuffer
 from typing import Literal, Sequence
-from nnxrl.agents.sac import update_sac, TrainState
-from nnxrl.utils.network import EnsembleCritic, SquashedTanhGaussianActor, Alpha
-from nnxrl.utils.dmc_wrapper import make_env_dmc
+from nnxrl.utils.replaybuffer import ReplayBuffer
+from nnxrl.agents.td3 import update_td3, TrainState
 from nnxrl.utils.normalization import RMS
+from nnxrl.model import EnsembleCritic, TanhDetActor
+from nnxrl.env import load_env
 import time
 import numpy as np
+import jax.numpy as jnp
 import jax
 import optax
 import tyro
@@ -17,132 +18,123 @@ import dataclasses
 
 @dataclasses.dataclass
 class Args:
-    env_id: str = "humanoid-run"
+    env_id: str = "Ant-v4"
+    env_type: Literal['mujoco', 'dmc', 'humanoid_bench', 'myosuite'] = 'mujoco'
     seed: int = 0
     num_envs: int = 1
     total_timesteps: int = int(1e6)
     buffer_size: int = int(1e6)
     policy_frequency: int = 2
-    target_frequency: int = 1
-    learning_starts: int = int(5e3)
+    learning_starts: int = int(25e3)
     gamma: float = 0.99
     tau: float = 0.005
     batch_size: int = 256
     policy_lr: float = 3e-4
-    q_lr: float = 1e-3
-    alpha: float = 0.2
-    autotune: Literal[True, False] = True
-    target_entropy: float = 0  # will be set automatically
-    hidden_dim: Sequence[int] = (256, 256)
+    q_lr: float = 3e-4
+    policy_noise: float = 0.2
+    noise_clip: float = 0.5
+    exploration_noise: float = 0.1
+    critic_hidden_dim: Sequence[int] = (512, 512, 512)
+    critic_ln: Literal[True, False] = True
+    actor_hidden_dim: Sequence[int] = (512, 512)
+    actor_ln: Literal[True, False] = True
     num_q: int = 2
+    num_head: int = 100
 
-    # Automatically set for DMC environments, can be overridden manually
+
     action_repeat: int = 2
-    normalize_observation: Literal[True, False] = False
+    normalize_observation: Literal[True, False] = True
     simba: Literal[True, False] = False
-    decay_step: int = 0  # 0 means uniformal sampling
     grad_step_per_env_step: int = 1
 
-
-def make_env(env_id: str, seed: int, action_repeat: int = 1):
-    """Create environment."""
-    def load_env(env_id):
-        try:
-            # MUJOCO env id examples: "Ant-v5", "Humanoid-v5", ...
-            env = gym.make(env_id)
-        except Exception:
-            # DMC env id examples: "humanoid-run", "humanoid-stand", ...
-            env = make_env_dmc(env_id, action_repeat)
-        return env
-
-    def thunk():
-        env = load_env(env_id)
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
-        if hasattr(env, 'seed'):
-            env.seed(seed)
-        return env
-    return thunk
 
 
 
 def main():
-    print("🚀 sac training")
+    print("🚀 td3 training")
     print("=" * 60)
 
-    activation_fn = jax.nn.mish
-
     args = tyro.cli(Args)
+    if args.env_type == 'mujoco':
+        args.action_repeat = 1
 
     np.random.seed(args.seed)
-    env = [make_env(args.env_id, args.seed + i, args.action_repeat) for i in range(args.num_envs)]
-
+    env = [load_env(args.env_id, args.env_type, args.action_repeat, args.seed + i)
+           for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(env, autoreset_mode='SameStep')
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
-
     action_dim = int(np.prod(np.asarray(envs.single_action_space.shape)))
     obs_dim = int(np.prod(np.asarray(envs.single_observation_space.shape)))
-    args.target_entropy = - action_dim
 
-    wandb.init(project='sac', config=vars(args), name=f'{args.env_id}/decay_step_{args.decay_step}')
+    wandb.init(project='td3', config=vars(args), name=f'{args.env_id}')
 
     rngs = nnx.Rngs(args.seed)
-    actor = SquashedTanhGaussianActor(
-        obs_dim, action_dim, rngs.fork(),
-        hidden_dim=args.hidden_dim,
-        action_high=envs.single_action_space.high,
-        action_low=envs.single_action_space.low,
-        activation_fn=activation_fn,
-        simba_encoder=args.simba
-    )
-    critic = EnsembleCritic(
-        obs_dim,
+    actor = TanhDetActor(
+        obs_dim, 
         action_dim,
-        rngs.fork(split=args.num_q),
-        hidden_dim=args.hidden_dim,
-        activation_fn=activation_fn,
-        simba_encoder=args.simba
-    )
-    alpha = Alpha() if args.autotune else None
+        rngs.fork(), 
+        hidden_dim=args.actor_hidden_dim, 
+        action_high=envs.single_action_space.high, 
+        action_low=envs.single_action_space.low, 
+        simba_encoder=args.simba,
+        layer_norm=args.actor_ln)
+
+    critic = EnsembleCritic(
+        obs_dim, 
+        action_dim, 
+        rngs.fork(split=args.num_q), 
+        hidden_dim=args.critic_hidden_dim,
+        simba_encoder=args.simba,
+        layer_norm=args.critic_ln)
+
+
     actor_opt = nnx.Optimizer(actor, optax.adam(args.policy_lr))
     critic_opt = nnx.Optimizer(critic, optax.adam(args.q_lr))
-    alpha_opt = nnx.Optimizer(alpha, optax.adam(args.policy_lr)) if args.autotune else None
 
     rb = ReplayBuffer(
         envs.single_observation_space,
         envs.single_action_space,
         args.buffer_size,
         n_envs=args.num_envs,
-        linear_decay_steps=args.decay_step
     )
-
     if args.normalize_observation:
         rms = RMS.create(envs.single_observation_space.shape)
     else:
         rms = None
-
-    train_state = TrainState.create(actor, critic, actor_opt, critic_opt, rms, alpha=alpha, alpha_opt=alpha_opt)
+    train_state = TrainState.create(
+        actor=actor,
+        critic=critic,
+        actor_opt=actor_opt,
+        critic_opt=critic_opt,
+        rms=rms,
+    )
     start_time = time.time()
+
     @nnx.jit
-    def get_action(actor, rms, obs, key):
+    def get_action_with_exploration_noise(actor, rms, obs, key):
         if args.normalize_observation:
-            obs_for_policy, rms = rms.normalize(obs, rms)
+            obs_for_policy, rms = rms.normalize(obs, update=True)
         else:
             obs_for_policy = obs
-        actions, _ = actor.get_action(obs_for_policy, key=key)
+        actions = actor.get_action(obs_for_policy)
+        noise = jax.random.normal(key, shape=actions.shape) * actor.action_scale * args.exploration_noise
+        actions = jnp.clip(
+            noise + actions, envs.single_action_space.low,  envs.single_action_space.high)
         return rms, actions
 
-    jit_update = nnx.jit(lambda ts, big_batch, key: update_sac(
+    jit_update = nnx.jit(lambda ts, big_batch, key: update_td3(
         ts, args, key, big_batch), donate_argnums=0)
+
     obs, _ = envs.reset(seed=args.seed)
-    action_key, update_key = jax.random.split(jax.random.PRNGKey(args.seed))
+    step_key, update_key = jax.random.split(jax.random.PRNGKey(args.seed), 2)
+
     for global_step in range(1, args.total_timesteps + 1):
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample()
                                for _ in range(args.num_envs)])
         else:
-            rms, actions = get_action(
-                train_state.actor, train_state.rms, obs, jax.random.fold_in(action_key, global_step))
+            rms, actions = get_action_with_exploration_noise(
+                train_state.actor, train_state.rms, obs, jax.random.fold_in(step_key, global_step))
             train_state = train_state.replace(rms=rms)
             actions = np.asarray(actions)
 
@@ -182,8 +174,7 @@ def main():
         )
 
         if global_step >= args.learning_starts:
-            big_batch = rb.sample(
-                args.batch_size * args.grad_step_per_env_step)
+            big_batch = rb.sample(args.batch_size * args.grad_step_per_env_step)
             train_state, info = jit_update(
                 train_state, big_batch, jax.random.fold_in(
                     update_key, global_step)

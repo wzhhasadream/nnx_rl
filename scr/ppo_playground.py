@@ -1,22 +1,22 @@
 import jax.numpy as jnp
 import jax
-from nnxrl.agents.ppo.train import TrainState, make_train
-from nnxrl.utils.normalization import rms_init
-from nnxrl.utils.brax_wrapper import wrap_for_training
-from nnxrl.agents.ppo.network import ActorCritic
+from nnxrl.agents.ppo import TrainState, rollout, update_ppo, ActorCritic
+from nnxrl.utils import RMS, evaluate_playground_policy
+from nnxrl.model import GaussianActor, VNetwork
+from nnxrl.env import make_playground_env
 from flax import nnx
 import optax
 import dataclasses
 import tyro
 import nnxrl.utils.logger as wandb
 from typing import Literal, Sequence
-import time
 
 
 @dataclasses.dataclass
 class Args:
-    env_id: str = 'SwimmerSwimmer6'
-    seed: int = 1
+    env_id: str = 'FishSwim'
+    env_type: Literal["brax", "playground"] = "playground"
+    seed: int = 6
     num_envs: int = 2048
     total_timesteps: int = int(6e7)
     gamma: float = 0.995
@@ -35,11 +35,14 @@ class Args:
     num_minibatches: int = 32
     update_epochs: int = 4
     reward_scale: float = 10
-    hidden_dim: Sequence[int] = (256, 256)
+    actor_hidden_dim: Sequence[int] = (512, 256, 128)
+    critic_hidden_dim: Sequence[int] = (512, 256, 128)
+    actor_ln: Literal[True, False] = False
+    critic_ln: Literal[True, False] = False
+    simba: Literal[True, False] = False
     action_repeat: int = 1
-
-    num_evals: int = 10
-    eval_step: int = 1000
+    log_frequency: int = 20
+    num_evals: int = 100
 
 
 def main():
@@ -63,31 +66,21 @@ def main():
             f"num_rollout ({num_rollout}) must be >= num_evals ({args.num_evals}) "
         )
 
-    activation_fn = jax.nn.mish
 
     steps_per_rollout = args.num_minibatches * args.update_epochs
     wandb.init(project='ppo', config=vars(args), name=f'{args.env_id}')
-    start_time = time.time()
+    rngs = nnx.Rngs(args.seed)
 
-    def train_log_fn(avg_metrics, global_step):
-        avg_metrics["time"] = time.time() - start_time
-        wandb.log(avg_metrics, int(global_step), commit=False)
-        if "eval/episode_return" in avg_metrics:
-            print(
-                f"eval/episode_return:{float(avg_metrics['eval/episode_return']):.3f},"
-                f"eval/episode_length:{float(avg_metrics.get('eval/episode_length', 0.0)):.3f},"
-                f"time:{time.time() - start_time:.3f},"
-                f"global_step:{global_step}"
-            )
-
-    env = wrap_for_training(
+    env = make_playground_env(
         args.env_id,
-        action_repeat=args.action_repeat,
-        normalize_reward=args.normalize_reward,
-        reward_gamma=args.gamma
+        args.env_type,
+        action_repeat=args.action_repeat
     )
-    agent = ActorCritic(env.observation_size, env.action_size, nnx.Rngs(
-        args.seed), hidden_dim=args.hidden_dim, activation_fn=activation_fn)
+    obs_dim = env.observation_size
+    action_dim = env.action_size
+    actor = GaussianActor(obs_dim, action_dim, rngs.fork(), args.actor_hidden_dim, layer_norm=args.actor_ln, simba_encoder=args.simba, squash_log_std=False, shared_std=True, activation_fn=jax.nn.relu)
+    v = VNetwork(obs_dim, rngs.fork(), args.critic_hidden_dim, layer_norm=args.critic_ln, simba_encoder=args.simba, activation_fn=jax.nn.relu)
+    agent = ActorCritic(actor, v)
 
     def lr_schedule(step):
         progress = (step // steps_per_rollout) / max(num_rollout, 1)
@@ -104,14 +97,41 @@ def main():
         )
     optimizer = nnx.Optimizer(agent, optimizer_chain)
     if args.normalize_observation:
-        rms = rms_init(env.observation_size)
+        rms = RMS.create(env.observation_size)
     else:
         rms = None
-    train_state = TrainState(agent=agent, opt=optimizer,
-                             rms=rms)  # Init trainstate
+    ts = TrainState(agent=agent, opt=optimizer,
+                             rms=rms) 
 
-    train = nnx.jit(make_train(env, args, train_log_fn), donate_argnums=0)
-    final_ts = train(train_state)   # return the final trainstate
+    jit_update = nnx.jit(lambda ts, traj, key: update_ppo(ts, traj, args, key), donate_argnums=0)
+    jit_rollout = nnx.jit(lambda ts, state, key: rollout(ts, env, state, key, args))
+
+    def eval(ts):
+        def policy(obs):
+            if args.normalize_observation:
+                obs_for_policy, _ = ts.rms.normalize(obs, update=False)
+            else:
+                obs_for_policy = obs
+            actions = ts.agent.actor.get_mean_action(obs_for_policy)
+            return actions
+        return evaluate_playground_policy(env, policy, args.num_evals)
+
+    jit_eval = nnx.jit(eval)
+
+    state = env.reset(jax.random.split(jax.random.PRNGKey(args.seed), args.num_envs))
+    rollout_key, update_key = jax.random.split(jax.random.PRNGKey(args.seed))
+
+    for rollout_idx in range(1, num_rollout + 1):
+        state, ts, traj = jit_rollout(ts, state, jax.random.fold_in(rollout_key, rollout_idx))
+        
+        ts, info = jit_update(ts, traj, jax.random.fold_in(update_key, rollout_idx))
+        if rollout_idx % args.log_frequency == 0:
+            score = jit_eval(ts)
+            print(score)
+            wandb.log({**info, "episode_return": score}, rollout_idx * args.num_envs * args.rollout_steps)
+
+
+# return the final trainstate
     wandb.finish()
 
 

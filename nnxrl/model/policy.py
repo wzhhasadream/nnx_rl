@@ -286,4 +286,3 @@ class MultivariateBetaPolicy:
         action = d.sample(seed=key)
         log_prob = d.log_prob(action)
         return action, log_prob
-

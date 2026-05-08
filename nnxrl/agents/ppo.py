@@ -1,17 +1,14 @@
-from __future__ import annotations
-
 import jax
 import jax.numpy as jnp
 from flax import nnx, struct
-from typing import Callable, NamedTuple, Protocol
-from .network import ActorCritic
-from mujoco_playground._src import mjx_env
-from ...utils.normalization import RMSState, rms_normalize
-from ...utils.evaluate import evaluate_policy
+from typing import NamedTuple, Protocol
+
+from jaxlib.mlir.dialects.sparse_tensor import ToSliceOffsetOp
+from ..model import VNetwork, GaussianActor
+from ..utils import save_states, load_states
+from ..utils import RMS
 
 class PPOConfig(Protocol):
-    # This protocol describes the minimal config interface required by PPO training code.
-    # Any object with these attributes (e.g., a dataclass from a script) can be used.
     seed: int
     total_timesteps: int
     num_envs: int
@@ -38,18 +35,50 @@ class PPOConfig(Protocol):
     eval_step: int
 
 
+
+
+class ActorCritic(nnx.Module):
+    def __init__(self, actor: GaussianActor, critic: VNetwork):
+        self.actor = actor
+        self.critic = critic
+
+
+
 @struct.dataclass
 class TrainState:
     agent: ActorCritic
     opt: nnx.Optimizer
-    rms: RMSState | dict[str, RMSState] | None = None
+    rms: RMS | None = None
+
+    @classmethod
+    def create(cls, agent, opt, rms=None):
+        return cls(
+            agent=agent,
+            opt=opt,
+            rms=rms
+        )
+
+    def save(self, path: str):
+        save_states(path, {
+            "agent": self.agent,
+            "opt": self.opt, 
+            "rms": self.rms
+        })
+    def load(self, path: str):
+        state = load_states(path, {
+            "agent": self.agent,
+            "opt": self.opt,
+            "rms": self.rms
+        })
+
+        self.rms = state["rms"]
+
 
 
 class Trajectory(NamedTuple):
-                                                    # (num_steps, num_envs, obs_dim)
-    observations: jax.Array | dict[str, jax.Array]                
-                                                    # (num_steps, num_envs, action_dim) or (num_steps, num_envs)
-    actions: jax.Array
+                                                    
+    observations: jax.Array                         # (num_steps, num_envs, obs_dim)
+    actions: jax.Array                              # (num_stpes, num_envs, action_dim)
     log_probs: jax.Array                            # (num_steps, num_envs)
     values: jax.Array                               # (num_steps + 1, num_envs)
     dones: jax.Array                                # (num_steps + 1, num_envs)
@@ -61,10 +90,12 @@ def ppo_loss(
     batch: dict[str, jax.Array],
     config: PPOConfig,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    _, new_log_probs, values, entropy = agent.get_action_and_value(
+    actor, critic = agent.actor, agent.critic
+    _, new_log_probs, entropy = actor.get_action(
         batch["observations"], actions=batch["actions"])
+    values = critic(batch["observations"]).squeeze()
 
-    log_ratio = new_log_probs - batch["log_probs"]
+    log_ratio = new_log_probs.squeeze() - batch["log_probs"]
     ratio = jnp.exp(log_ratio)
 
     pg_loss_unclipped = ratio * batch["advantages"]
@@ -104,7 +135,7 @@ def ppo_loss(
 
 
 def ppo_update_minibatch(
-    train_state: TrainState,
+    ts: TrainState,
     batch: dict[str, jax.Array],
     config: PPOConfig
 ) -> tuple[TrainState, dict[str, jax.Array]]:
@@ -113,13 +144,13 @@ def ppo_update_minibatch(
             jnp.std(batch["advantages"]) + 1e-8
         )
 
-    def loss_fn(agent: ActorCritic):
+    def loss_fn(agent):
         return ppo_loss(agent, batch, config)
     (_loss, info), grads = nnx.value_and_grad(
-        loss_fn, has_aux=True)(train_state.agent)
+        loss_fn, has_aux=True)(ts.agent)
     
-    train_state.opt.update(grads)
-    return train_state, info
+    ts.opt.update(grads)
+    return ts, info
 
 
 def compute_gae(
@@ -186,11 +217,8 @@ def ppo_update_rollout(
         trajectory.actions.shape[1]
 
     def _flatten_time_env(x: jax.Array) -> jax.Array:
-        """Flattens (T, N, ...) -> (T*N, ...) without collapsing feature dimensions.
-        """
-        if x.ndim >= 3:
-            return x.reshape((batch_size,) + x.shape[2:])
-        return x.reshape((batch_size,))
+        return x.reshape((batch_size,) + x.shape[2:])
+
 
     flat_data = jax.tree.map(
         _flatten_time_env,
@@ -262,11 +290,11 @@ def ppo_update_rollout(
     return updated_train_state, metrics
 
 
-def ppo_update_from_trajectory(
+def update_ppo(
     train_state: TrainState,
     trajectory: Trajectory,
     config: PPOConfig,
-    rng: jax.Array
+    key: jax.Array
 ) -> tuple[TrainState, dict[str, jax.Array]]:
     trajectory = trajectory._replace(rewards = config.reward_scale * trajectory.rewards)
     advantages, returns = compute_gae(
@@ -282,7 +310,7 @@ def ppo_update_from_trajectory(
         advantages,
         returns,
         config,
-        rng
+        key
     )
 
     return train_state, avg_metrics
@@ -293,34 +321,31 @@ def ppo_update_from_trajectory(
 #####################################################################
 
 
-def collect_rollout(
-    train_state: TrainState,
-    envs: mjx_env.MjxEnv,
-    init_state: mjx_env.State,
+def rollout(
+    ts: TrainState,
+    envs,
+    init_state,
     key: jax.Array,
     config: PPOConfig,
 ):
 
-
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
-    def collect_step(carry, step_idx):
-        state, train_state = carry
-        observations = state.obs
-        if config.normalize_observation and train_state.rms is not None:
-            obs_for_policy, rms = rms_normalize(
-                observations, train_state.rms
-            )
-            train_state = train_state.replace(rms=rms)
+    def one_step(carry, step_idx):
+        state, ts = carry
+        obs = state.obs
+        if config.normalize_observation and ts.rms is not None:
+            obs_for_policy, rms = ts.rms.normalize(obs)
+            ts = ts.replace(rms=rms)
         else:
-            obs_for_policy = observations
+            obs_for_policy = obs
 
-        actions, log_probs, values, _ = train_state.agent.get_action_and_value(
+        actions, log_probs, _, values = *ts.agent.actor.get_action(
             obs_for_policy, key=jax.random.fold_in(key, step_idx)
-        )
+        ), ts.agent.critic(obs_for_policy)
 
         next_state = envs.step(state, actions)
 
-        return (next_state, train_state), (
+        return (next_state, ts), (
             obs_for_policy,
             actions,
             log_probs.reshape(config.num_envs),
@@ -329,30 +354,29 @@ def collect_rollout(
             state.done.reshape(config.num_envs),
         )
 
-    (final_state, train_state), (
+    (final_state, ts), (
         stacked_obs,
         stacked_actions,
         stacked_log_probs,
         stacked_values,
         stacked_rewards,
         stacked_dones,
-    ) = collect_step((init_state, train_state), jnp.arange(config.rollout_steps))
+    ) = one_step((init_state, ts), jnp.arange(config.rollout_steps))
 
-    if config.normalize_observation and train_state.rms is not None:
-        obs_for_value, _ = rms_normalize(
-            final_state.obs, train_state.rms, update=False)
+    if config.normalize_observation and ts.rms is not None:
+        obs_for_value, _ = ts.rms.normalize(
+            final_state.obs, update=False)
     else:
         obs_for_value = final_state.obs
-    final_value = train_state.agent.get_value(obs_for_value).reshape(config.num_envs)   # (num_envs, )
+    final_value = ts.agent.critic(
+        obs_for_value).reshape(config.num_envs)   # (num_envs, )
     final_done = final_state.done.reshape(config.num_envs)
     stacked_values = jnp.concatenate(
         [stacked_values, final_value[None, :]], axis=0)
     stacked_dones = jnp.concatenate(
         [stacked_dones, final_done[None, :]], axis=0)
 
-
-
-    return (final_state, train_state), Trajectory(
+    return final_state, ts, Trajectory(
         stacked_obs,
         stacked_actions,
         stacked_log_probs,
@@ -362,66 +386,3 @@ def collect_rollout(
     )
 
 
-def make_train(
-        envs: mjx_env.MjxEnv,
-        config: PPOConfig,
-        train_log_fn: Callable):
-    def train(init_train_state: TrainState) -> TrainState:
-        key = jax.random.PRNGKey(config.seed)
-        env_key, key = jax.random.split(key, 2)
-        jit_reset = jax.jit(envs.reset)
-        init_state = jit_reset(jax.random.split(env_key, config.num_envs))
-        num_rollout = config.total_timesteps // (
-            config.num_envs * config.rollout_steps)
-        rollout_indices = jnp.arange(1, num_rollout + 1, dtype=jnp.int32)
-
-        eval_indices = jnp.floor(
-            jnp.linspace(1, num_rollout, config.num_evals)
-        ).astype(jnp.int32)
-
-        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry))
-        def rollout_and_update(carry, rollout_idx):
-            rollout_key = jax.random.fold_in(key, rollout_idx)
-            rollout_rng, update_rng = jax.random.split(rollout_key, 2)
-            state, train_state = carry
-
-            (next_state, train_state), trajectory = collect_rollout(
-
-                train_state,
-                envs,
-                state,
-                rollout_rng,
-                config=config
-            )
-
-            train_state, train_metrics = ppo_update_from_trajectory(
-                train_state,
-                trajectory,
-                config,
-                update_rng
-            )
-
-            should_eval = jnp.any(eval_indices == rollout_idx)
-
-            def _eval_and_log():
-                eval_rng = jax.random.fold_in(rollout_rng, rollout_idx)
-                eval_metrics = evaluate_policy(
-                    envs,
-                    lambda obs, key: train_state.agent(obs).sample(seed=key),
-                    eval_rng,
-                    train_state.rms,
-                    num_steps=config.eval_step
-                )
-                merged = {**train_metrics, **eval_metrics}
-                jax.debug.callback(
-                    train_log_fn, merged, rollout_idx * config.num_envs * config.rollout_steps)
-                return None
-
-            nnx.cond(should_eval, _eval_and_log, lambda: None)
-            return (next_state, train_state)
-
-        final_state, final_train_state = rollout_and_update(
-            (init_state, init_train_state), rollout_indices,
-        )
-        return final_train_state
-    return train
