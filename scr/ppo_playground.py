@@ -14,9 +14,9 @@ from typing import Literal, Sequence
 
 @dataclasses.dataclass
 class Args:
-    env_id: str = 'FishSwim'
+    env_id: str = 'BallInCup'
     env_type: Literal["brax", "playground"] = "playground"
-    seed: int = 6
+    seed: int = 0
     num_envs: int = 2048
     total_timesteps: int = int(6e7)
     gamma: float = 0.995
@@ -41,8 +41,8 @@ class Args:
     critic_ln: Literal[True, False] = False
     simba: Literal[True, False] = False
     action_repeat: int = 1
-    log_frequency: int = 20
-    num_evals: int = 100
+    log_frequency: int = 50
+    eval_episode: int = 100
 
 
 def main():
@@ -61,10 +61,6 @@ def main():
         args.action_repeat = 4
     num_rollout = int(args.total_timesteps /
                       (args.rollout_steps * args.num_envs))
-    if num_rollout < args.num_evals:
-        raise ValueError(
-            f"num_rollout ({num_rollout}) must be >= num_evals ({args.num_evals}) "
-        )
 
 
     steps_per_rollout = args.num_minibatches * args.update_epochs
@@ -114,7 +110,7 @@ def main():
                 obs_for_policy = obs
             actions = ts.agent.actor.get_mean_action(obs_for_policy)
             return actions
-        return evaluate_playground_policy(env, policy, args.num_evals)
+        return evaluate_playground_policy(env, policy, args.eval_episode, seed=args.seed + 1)
 
     jit_eval = nnx.jit(eval)
 
@@ -131,7 +127,8 @@ def main():
             wandb.log({**info, "episode_return": score}, rollout_idx * args.num_envs * args.rollout_steps)
 
 
-# return the final trainstate
+    score = jit_eval(ts)
+    wandb.log({"episode_return": score}, args.total_timesteps)
     wandb.finish()
 
 

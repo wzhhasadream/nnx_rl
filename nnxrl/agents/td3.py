@@ -90,7 +90,7 @@ class TrainState:
             "grad_updates": self.grad_updates
         })
 
-        self.grad_updates = state_map["grad_updates"]
+        return self.replace(grad_updates=state_map["grad_updates"], rms=state_map["rms"])
 
 
 

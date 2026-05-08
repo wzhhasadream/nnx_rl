@@ -2,11 +2,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx, struct
 from typing import NamedTuple, Protocol
-
-from jaxlib.mlir.dialects.sparse_tensor import ToSliceOffsetOp
 from ..model import VNetwork, GaussianActor
-from ..utils import save_states, load_states
-from ..utils import RMS
+from ..utils import save_states, load_states, RMS
 
 class PPOConfig(Protocol):
     seed: int
@@ -70,8 +67,7 @@ class TrainState:
             "opt": self.opt,
             "rms": self.rms
         })
-
-        self.rms = state["rms"]
+        return self.replace(rms=state["rms"])
 
 
 
@@ -384,5 +380,4 @@ def rollout(
         stacked_dones,
         stacked_rewards,
     )
-
 
