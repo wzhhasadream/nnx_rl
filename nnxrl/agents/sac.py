@@ -283,8 +283,8 @@ def update_sac(train_state: TrainState, config: SACConfig, key: jax.Array, big_b
 
     updated_train_state, infos = update_sac_minibatch(
         train_state, batches, update_keys)
-    avg_info = jax.tree.map(jnp.mean, infos)
-    return updated_train_state, avg_info
+    info = jax.tree.map(lambda x : x[-1], infos)
+    return updated_train_state, info
 
 
 def sample_and_update_sac(

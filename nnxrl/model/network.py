@@ -232,8 +232,6 @@ class GaussianActor(nnx.Module):
 
         self.action_high = action_high
         self.action_low = action_low
-        self.action_scale = (action_high - action_low) / 2
-        self.action_bias = (action_high + action_low) / 2
 
         self.obs_dim = flattened_dim(obs_dim)
         self.shared_std = shared_std

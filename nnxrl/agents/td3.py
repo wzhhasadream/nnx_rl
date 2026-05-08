@@ -1,5 +1,5 @@
 from copy import deepcopy
-from typing import Dict, Tuple, Callable, Protocol
+from typing import Dict, Tuple, Protocol
 import jax
 import jax.numpy as jnp
 from flax import nnx, struct
@@ -247,9 +247,9 @@ def update_td3(
 
     ts, infos = update_td3_mininbatch(train_state, batches, jnp.arange(config.grad_step_per_env_step))
 
-    avg_info = jax.tree.map(jnp.mean, infos)
+    info = jax.tree.map(lambda x : x[-1], infos)
 
-    return ts, avg_info
+    return ts, info
 
 
 
