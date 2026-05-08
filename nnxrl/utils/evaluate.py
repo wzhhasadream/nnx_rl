@@ -44,10 +44,11 @@ def evaluate_playground_policy(
     policy,
     eval_episodes: int = 100,
     max_eval_steps: int = 1_000,
+    seed: int = 0
 ):
     
     num_envs = eval_episodes
-    init_state = env.reset(jax.random.split(jax.random.PRNGKey(0), num_envs))
+    init_state = env.reset(jax.random.split(jax.random.PRNGKey(seed), num_envs))
     def cond_fn(carry):
         state, returns_buffer, count, step = carry
         return jnp.logical_and(count < eval_episodes, step < max_eval_steps)
