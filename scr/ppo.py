@@ -1,7 +1,7 @@
 
 import jax.numpy as jnp
 from nnxrl.agents.ppo import ActorCritic, TrainState, update_ppo, Trajectory
-from nnxrl.utils import RMS
+from nnxrl.utils import evaluate_policy
 from flax import nnx
 import jax
 from nnxrl.env import load_env
@@ -46,6 +46,8 @@ class Args:
     critic_ln: Literal[True, False] = False
     simba: Literal[True, False] = False
     action_repeat: int = 1
+    eval_episode: int = 100
+    eval_frequency: int = 50
 
 
 
@@ -160,16 +162,12 @@ def main():
                 episode_length = infos["episode"]['l'][next_dones].mean()
                 current_time = time.time()
                 total_time = current_time - start_time
-                avg_speed = (global_step) / \
-                    total_time if total_time > 0 else 0
 
-                print(f"🎉 Step {global_step:,}: Episode return {episode_return:.1f} (length: {episode_length}) "
-                        f"⚡ {avg_speed:.1f} steps/s")
 
                 wandb.log({
-                    "episode_return": episode_return,
-                    "episode_length": episode_length,
-                    "wall_time": total_time
+                    "training/episode_return": episode_return,
+                    "training/episode_length": episode_length,
+                    "training/wall_time": total_time
                 }, global_step)           
 
             # Store rewards and dones
@@ -206,8 +204,11 @@ def main():
             ts.agent, envs, args.rollout_steps, obs, dones, jax.random.fold_in(rollout_key, rollout_idx), global_step)
         
         ts, info = jit_update(ts, traj, jax.random.fold_in(update_key, rollout_idx))
-        if rollout_idx % 10 == 0:
-            wandb.log(info, global_step)
+        if rollout_idx % args.eval_frequency == 0:
+            policy = ts.make_policy()
+            eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
+            wandb.log({**info, **eval_info}, global_step)
+
         obs = next_obs
         dones = next_dones
 

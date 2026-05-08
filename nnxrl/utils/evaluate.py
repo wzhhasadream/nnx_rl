@@ -20,7 +20,7 @@ def evaluate_policy(
     episodic_returns = []
     episodic_success = []
     while len(episodic_returns) < eval_episodes:
-        actions = policy(obs)
+        actions = np.asarray(policy(obs))
 
         next_obs, _, terminated, truncated, infos = envs.step(actions)
         dones = np.logical_or(terminated, truncated)
@@ -31,11 +31,12 @@ def evaluate_policy(
 
         obs = next_obs
 
-    success_rate = None
+
     if len(episodic_success) > 0:
         success_rate = float(np.mean(episodic_success) * 100)
+        return {"eval/episode_return": float(np.mean(episodic_returns)), "eval/success_rate": success_rate}
 
-    return float(np.mean(episodic_returns)), success_rate
+    return {"eval/episode_return": float(np.mean(episodic_returns))}
 
 
 
@@ -97,4 +98,4 @@ def evaluate_playground_policy(
     )
 
     mean_return = returns_buffer.sum() / jnp.maximum(count, 1)
-    return mean_return
+    return {"eval/episode_return": mean_return}

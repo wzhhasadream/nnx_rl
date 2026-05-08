@@ -1,9 +1,8 @@
 import nnxrl.utils.logger as wandb
 from flax import nnx
 from typing import Literal, Sequence
-from nnxrl.utils.replaybuffer import ReplayBuffer
+from nnxrl.utils import ReplayBuffer, RMS, evaluate_policy
 from nnxrl.agents.td3 import update_td3, TrainState
-from nnxrl.utils.normalization import RMS
 from nnxrl.model import EnsembleCritic, TanhDetActor
 from nnxrl.env import load_env
 import time
@@ -36,7 +35,7 @@ class Args:
     exploration_noise: float = 0.1
     critic_hidden_dim: Sequence[int] = (512, 512, 512)
     critic_ln: Literal[True, False] = True
-    actor_hidden_dim: Sequence[int] = (512, 512)
+    actor_hidden_dim: Sequence[int] = (512, 512, 512)
     actor_ln: Literal[True, False] = True
     num_q: int = 2
     num_head: int = 100
@@ -47,7 +46,8 @@ class Args:
     simba: Literal[True, False] = False
     grad_step_per_env_step: int = 1
 
-
+    eval_frequency: int = int(1e4)
+    eval_episode: int = 100
 
 
 def main():
@@ -148,11 +148,6 @@ def main():
             episode_length = infos["episode"]['l'][done].mean()
             current_time = time.time()
             total_time = current_time - start_time
-            avg_speed = (global_step) / \
-                total_time if total_time > 0 else 0
-
-            print(f"🎉 Step {global_step:,}: Episode return {episode_return:.1f} (length: {episode_length}) "
-                    f"⚡ {avg_speed:.1f} steps/s")
 
             wandb.log({
                 "episode_return": episode_return,
@@ -179,9 +174,10 @@ def main():
                 train_state, big_batch, jax.random.fold_in(
                     update_key, global_step)
             )
-            if global_step % 999 == 0:
-                wandb.log(info, global_step)
-
+            if global_step % args.eval_frequency == 0:
+                policy = train_state.make_policy()
+                eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
+                wandb.log({**info, **eval_info}, global_step)
         obs = next_obs
 
     envs.close()

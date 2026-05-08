@@ -104,14 +104,7 @@ def main():
     jit_rollout = nnx.jit(lambda ts, state, key: rollout(ts, env, state, key, args))
 
     def eval(ts):
-        def policy(obs):
-            if args.normalize_observation:
-                obs_for_policy, _ = ts.rms.normalize(obs, update=False)
-            else:
-                obs_for_policy = obs
-            actions = ts.agent.actor.get_mean_action(obs_for_policy)
-            return actions
-        return evaluate_playground_policy(env, policy, args.eval_episode, seed=args.seed + 1)
+        return evaluate_playground_policy(env, ts.make_policy(), args.eval_episode, seed=args.seed + 1)
 
     jit_eval = nnx.jit(eval)
 
@@ -123,9 +116,8 @@ def main():
         
         ts, info = jit_update(ts, traj, jax.random.fold_in(update_key, rollout_idx))
         if rollout_idx % args.log_frequency == 0:
-            score = jit_eval(ts)
-            print(score)
-            wandb.log({**info, "episode_return": score, "wall_time": time.time() - start_time}, rollout_idx * args.num_envs * args.rollout_steps)
+            eval_info = jit_eval(ts)
+            wandb.log({**info, **eval_info, "wall_time": time.time() - start_time}, rollout_idx * args.num_envs * args.rollout_steps)
 
 
     score = jit_eval(ts)

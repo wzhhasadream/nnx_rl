@@ -69,6 +69,21 @@ class TrainState:
         })
         return self.replace(rms=state["rms"])
 
+    def make_policy(self):
+        def policy(obs):
+            if self.rms is not None:
+                obs_for_policy, _ = self.rms.normalize(obs, update=False)
+            else:
+                obs_for_policy = obs
+            
+            actions = self.agent.actor.get_mean_action(obs_for_policy)
+            return actions
+        return nnx.jit(policy)
+
+
+
+
+
 
 
 class Trajectory(NamedTuple):

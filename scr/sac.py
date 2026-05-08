@@ -4,7 +4,7 @@ from typing import Literal, Sequence
 from nnxrl.agents.sac import update_sac, TrainState
 from nnxrl.model import EnsembleCritic, SquashedTanhGaussianActor, Alpha
 from nnxrl.env import load_env
-from nnxrl.utils import RMS, ReplayBuffer
+from nnxrl.utils import RMS, ReplayBuffer, evaluate_policy
 import time
 import numpy as np
 import jax
@@ -46,6 +46,9 @@ class Args:
     normalize_observation: Literal[True, False] = True
     simba: Literal[True, False] = False
     grad_step_per_env_step: int = 1
+
+    eval_frequency: int = 1e4
+    eval_episode: int = 100
 
 
 
@@ -142,16 +145,11 @@ def main():
             episode_length = infos["episode"]['l'][done].mean()
             current_time = time.time()
             total_time = current_time - start_time
-            avg_speed = (global_step) / \
-                total_time if total_time > 0 else 0
-
-            print(f"🎉 Step {global_step:,}: Episode return {episode_return:.1f} (length: {episode_length}) "
-                    f"⚡ {avg_speed:.1f} steps/s")
 
             wandb.log({
-                "episode_return": episode_return,
-                "episode_length": episode_length,
-                "wall_time": total_time
+                "training/episode_return": episode_return,
+                "training/episode_length": episode_length,
+                "training/wall_time": total_time
             }, global_step)
 
         real_next_obs = next_obs.copy()
@@ -174,9 +172,10 @@ def main():
                 train_state, big_batch, jax.random.fold_in(
                     update_key, global_step)
             )
-            if global_step % 999 == 0:
-                wandb.log(info, global_step)
-
+            if global_step % args.eval_frequency == 0:
+                policy = train_state.make_policy()
+                eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
+                wandb.log({**info, **eval_info}, global_step)
         obs = next_obs
 
     envs.close()
