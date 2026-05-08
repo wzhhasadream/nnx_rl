@@ -18,6 +18,7 @@ def evaluate_policy(
     obs, _ = envs.reset()
 
     episodic_returns = []
+    episodic_success = []
     while len(episodic_returns) < eval_episodes:
         actions = policy(obs)
 
@@ -25,24 +26,31 @@ def evaluate_policy(
         dones = np.logical_or(terminated, truncated)
         if dones.any():
             episodic_returns.extend(infos["episode"]["r"][dones].tolist())
+            if "success" in infos:
+                episodic_success.extend(infos["success"][dones].tolist())
 
         obs = next_obs
 
-    return float(np.mean(episodic_returns[:eval_episodes]))
+    success_rate = None
+    if len(episodic_success) > 0:
+        success_rate = float(np.mean(episodic_success) * 100)
+
+    return float(np.mean(episodic_returns)), success_rate
+
 
 
 def evaluate_playground_policy(
     env,
     policy,
-    num_evals: int = 100,
+    eval_episodes: int = 100,
     max_eval_steps: int = 1_000,
 ):
     
-    num_envs = num_evals
+    num_envs = eval_episodes
     init_state = env.reset(jax.random.split(jax.random.PRNGKey(0), num_envs))
     def cond_fn(carry):
         state, returns_buffer, count, step = carry
-        return jnp.logical_and(count < num_evals, step < max_eval_steps)
+        return jnp.logical_and(count < eval_episodes, step < max_eval_steps)
 
     def body_fn(carry):
         state, returns_buffer, count, step = carry
@@ -55,7 +63,7 @@ def evaluate_playground_policy(
 
         def write_one(write_carry, i):
             returns_buffer, count = write_carry
-            valid = jnp.logical_and(done[i], count < num_evals)
+            valid = jnp.logical_and(done[i], count < eval_episodes)
 
             returns_buffer = jax.lax.cond(
                 valid,
@@ -74,7 +82,7 @@ def evaluate_playground_policy(
 
         return next_state, returns_buffer, count, step + 1
 
-    init_returns = jnp.zeros((num_evals,), dtype=jnp.float32)
+    init_returns = jnp.zeros((eval_episodes,), dtype=jnp.float32)
 
     final_state, returns_buffer, count, step = jax.lax.while_loop(
         cond_fn,
