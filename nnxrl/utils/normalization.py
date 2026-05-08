@@ -32,6 +32,34 @@ class RMS:
             epsilon=epsilon
         )
 
+    @classmethod
+    def create_from(
+        cls,
+        mean: jax.Array,
+        var: jax.Array,
+        count: int | float | jax.Array,
+        epsilon: float = 1e-4,
+    ) -> "RMS":
+        mean = jnp.asarray(mean, dtype=jnp.float32)
+        var = jnp.asarray(var, dtype=jnp.float32)
+        count = jnp.asarray(count, dtype=jnp.float32)
+
+        if mean.shape != var.shape:
+            raise ValueError(
+                f"mean.shape {mean.shape} must match var.shape {var.shape}"
+            )
+        if count.ndim != 0:
+            raise ValueError(f"count must be a scalar, got shape {count.shape}")
+        if float(count) <= 0.0:
+            raise ValueError(f"count must be positive, got {float(count)}")
+
+        return cls(
+            mean=mean,
+            var=var,
+            count=count,
+            epsilon=epsilon
+        )
+
     def update(
         self,
         batch: jax.Array ,
@@ -62,6 +90,5 @@ class RMS:
 
         norm_state = (batch - rms.mean) / jnp.sqrt(rms.var + rms.epsilon)
         return norm_state, rms
-
 
 
