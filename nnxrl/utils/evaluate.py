@@ -31,7 +31,7 @@ def evaluate_policy(
 
         obs = next_obs
 
-
+    envs.close()
     if len(episodic_success) > 0:
         success_rate = float(np.mean(episodic_success) * 100)
         return {"eval/episode_return": float(np.mean(episodic_returns)), "eval/success_rate": success_rate}
