@@ -152,7 +152,7 @@ def main():
                 "episode_return": episode_return,
                 "episode_length": episode_length,
                 "wall_time": total_time
-            }, global_step, commit=False)
+            }, global_step)
 
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):

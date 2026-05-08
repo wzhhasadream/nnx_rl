@@ -170,7 +170,7 @@ def main():
                     "episode_return": episode_return,
                     "episode_length": episode_length,
                     "wall_time": total_time
-                }, global_step, commit=False)           
+                }, global_step)           
 
             # Store rewards and dones
             rewards_list.append(rewards)

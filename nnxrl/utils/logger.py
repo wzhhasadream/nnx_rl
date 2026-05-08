@@ -2,7 +2,6 @@ import atexit
 import csv
 import json
 import os
-import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Union
 
@@ -29,6 +28,7 @@ def _to_python_scalar(value: Any) -> Any:
             if isinstance(scalar, float):
                 return round(scalar, 4)
             return scalar
+        return arr.tolist()
     return value
 
 
@@ -45,13 +45,9 @@ class Run:
         self.project = project
         self.name = name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.step_count = 0
-        self.metrics_by_step: dict[int, dict[str, Any]] = {}
-        self.columns: set[str] = {"step"}
         self.flush_every = flush_every
         self.flush_interval = flush_interval
-        self.pending_updates = 0
-        self.last_flush_time = time.monotonic()
-        self.dirty = False
+        self._finished = False
 
         cfg = config or {}
         self.seed = cfg.get("seed")
@@ -59,20 +55,29 @@ class Run:
         os.makedirs(dir, exist_ok=True)
         self.run_dir = os.path.join(dir, project, self.name)
         os.makedirs(self.run_dir, exist_ok=True)
+        global run_dir
+        run_dir = self.run_dir
 
         if self.seed is not None:
             self.run_dir = os.path.join(self.run_dir, f"seed_{self.seed}")
-            global run_dir
             run_dir = self.run_dir
             os.makedirs(self.run_dir, exist_ok=True)
 
+        self.metrics_jsonl_file = os.path.join(self.run_dir, "metrics.jsonl")
         self.metrics_file = os.path.join(self.run_dir, "metrics.csv")
         self.config_file = os.path.join(self.run_dir, "config.json")
 
         self.config = cfg
         if self.config:
-            with open(self.config_file, "w") as f:
+            with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2)
+
+        self._metrics_fp = open(
+            self.metrics_jsonl_file,
+            "w",
+            encoding="utf-8",
+            buffering=1,
+        )
 
     def log(
         self,
@@ -80,62 +85,67 @@ class Run:
         step: Optional[int] = None,
         commit: bool = True,
     ):
+        if self._finished:
+            raise RuntimeError("Run has already been finished.")
+
         if step is None:
             step = self.step_count
 
-        row = self.metrics_by_step.get(step, {"step": step})
+        row = {"step": step}
         for key, value in data.items():
             row[key] = _to_python_scalar(value)
-            self.columns.add(key)
 
-        self.metrics_by_step[step] = row
-        self.pending_updates += 1
-        self.dirty = True
+        self._metrics_fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self._metrics_fp.flush()
 
         if commit:
             self.step_count = max(self.step_count, step + 1)
 
-        self._maybe_flush(commit=commit)
-
-    def _maybe_flush(self, commit: bool):
-        if not self.dirty:
-            return
-
-        now = time.monotonic()
-        should_flush = False
-
-        if commit and self.pending_updates >= self.flush_every:
-            should_flush = True
-        elif now - self.last_flush_time >= self.flush_interval:
-            should_flush = True
-
-        if should_flush:
-            self.flush()
-
     def flush(self):
-        if not self.metrics_by_step:
+        if self._finished:
             return
 
-        columns = ["step"] + sorted(k for k in self.columns if k != "step")
-        tmp_file = f"{self.metrics_file}.tmp"
+        self._metrics_fp.flush()
 
-        with open(tmp_file, "w", newline="") as f:
+    def _convert_jsonl_to_csv(self):
+        rows_by_step: dict[int, dict[str, Any]] = {}
+        all_keys: set[str] = set()
+
+        with open(self.metrics_jsonl_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                row = json.loads(line)
+                step = row["step"]
+                merged_row = rows_by_step.setdefault(step, {"step": step})
+                for key, value in row.items():
+                    if key == "step":
+                        continue
+                    merged_row[key] = value
+                    all_keys.add(key)
+
+        columns = ["step"] + sorted(all_keys)
+
+        with open(self.metrics_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=columns)
             writer.writeheader()
-            for step in sorted(self.metrics_by_step.keys()):
-                row = self.metrics_by_step[step]
-                csv_row = {col: row.get(col, "") for col in columns}
-                writer.writerow(csv_row)
-
-        os.replace(tmp_file, self.metrics_file)
-        self.pending_updates = 0
-        self.last_flush_time = time.monotonic()
-        self.dirty = False
+            for step in sorted(rows_by_step):
+                row = rows_by_step[step]
+                writer.writerow({col: row.get(col, "") for col in columns})
 
     def finish(self):
+        if self._finished:
+            return
+
         self.flush()
+        self._metrics_fp.close()
+        self._convert_jsonl_to_csv()
+        self._finished = True
         global _current_run
-        _current_run = None
+        if _current_run is self:
+            _current_run = None
         print(f"Run finished. Data saved to: {self.run_dir}")
 
 

@@ -10,7 +10,7 @@ import dataclasses
 import tyro
 import nnxrl.utils.logger as wandb
 from typing import Literal, Sequence
-
+import time
 
 @dataclasses.dataclass
 class Args:
@@ -66,6 +66,7 @@ def main():
     steps_per_rollout = args.num_minibatches * args.update_epochs
     wandb.init(project='ppo', config=vars(args), name=f'{args.env_id}')
     rngs = nnx.Rngs(args.seed)
+    start_time = time.time()
 
     env = make_playground_env(
         args.env_id,
@@ -124,7 +125,7 @@ def main():
         if rollout_idx % args.log_frequency == 0:
             score = jit_eval(ts)
             print(score)
-            wandb.log({**info, "episode_return": score}, rollout_idx * args.num_envs * args.rollout_steps)
+            wandb.log({**info, "episode_return": score, "wall_time": time.time() - start_time}, rollout_idx * args.num_envs * args.rollout_steps)
 
 
     score = jit_eval(ts)
