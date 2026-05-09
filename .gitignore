@@ -42,3 +42,4 @@ wandb/
 # Local scratch notebook in this repo
 test.ipynb
 exp.sh
+nnxrl/model/copuled_flow.py
