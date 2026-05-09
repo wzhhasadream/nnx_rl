@@ -1,5 +1,6 @@
 import atexit
 import csv
+import hashlib
 import json
 import os
 from datetime import datetime
@@ -32,6 +33,20 @@ def _to_python_scalar(value: Any) -> Any:
     return value
 
 
+def _normalize_config(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _normalize_config(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_config(item) for item in value]
+    return _to_python_scalar(value)
+
+
+def _config_hash(config: Dict) -> str:
+    normalized = _normalize_config(config)
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
+
+
 class Run:
     def __init__(
         self,
@@ -51,9 +66,10 @@ class Run:
 
         cfg = config or {}
         self.seed = cfg.get("seed")
+        self.config_hash = _config_hash(cfg)
 
         os.makedirs(dir, exist_ok=True)
-        self.run_dir = os.path.join(dir, project, self.name)
+        self.run_dir = os.path.join(dir, project, self.name, f"cfg_{self.config_hash}")
         os.makedirs(self.run_dir, exist_ok=True)
         global run_dir
         run_dir = self.run_dir
@@ -70,7 +86,7 @@ class Run:
         self.config = cfg
         if self.config:
             with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2)
+                json.dump(_normalize_config(self.config), f, indent=2)
 
         self._metrics_fp = open(
             self.metrics_jsonl_file,
