@@ -1,7 +1,7 @@
 
 import jax.numpy as jnp
 from nnxrl.agents.ppo import ActorCritic, TrainState, update_ppo, Trajectory
-from nnxrl.utils import evaluate_policy
+from nnxrl.utils import evaluate_policy, RMS
 from flax import nnx
 import jax
 from nnxrl.env import load_env
@@ -47,7 +47,7 @@ class Args:
     simba: Literal[True, False] = False
     action_repeat: int = 1
     eval_episode: int = 100
-    eval_frequency: int = 50
+    eval_frequency: int = 20
 
 
 
@@ -206,14 +206,24 @@ def main():
         ts, info = jit_update(ts, traj, jax.random.fold_in(update_key, rollout_idx))
         if rollout_idx % args.eval_frequency == 0:
             policy = ts.make_policy()
-            eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
+            if args.normalize_observation:
+                rms = envs.obs_rms
+            else:
+                rms = None
+            eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode, rms=rms)
             wandb.log({**info, **eval_info}, global_step)
 
         obs = next_obs
         dones = next_dones
 
-    envs.close()
+    if args.normalize_observation:
+        rms = envs.obs_rms
+    else:
+        rms = None
+    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), ts.make_policy(), args.eval_episode, rms=rms)
+    wandb.log(final_info, args.total_timesteps)
     wandb.finish()
+    envs.close()
 
 
 if __name__ == "__main__":

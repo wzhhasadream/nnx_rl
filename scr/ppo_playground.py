@@ -41,7 +41,7 @@ class Args:
     critic_ln: Literal[True, False] = False
     simba: Literal[True, False] = False
     action_repeat: int = 1
-    log_frequency: int = 50
+    eval_frequency: int = 50
     eval_episode: int = 100
 
 
@@ -115,13 +115,13 @@ def main():
         state, ts, traj = jit_rollout(ts, state, jax.random.fold_in(rollout_key, rollout_idx))
         
         ts, info = jit_update(ts, traj, jax.random.fold_in(update_key, rollout_idx))
-        if rollout_idx % args.log_frequency == 0:
+        if rollout_idx % args.eval_frequency == 0:
             eval_info = jit_eval(ts)
             wandb.log({**info, **eval_info, "wall_time": time.time() - start_time}, rollout_idx * args.num_envs * args.rollout_steps)
 
 
-    score = jit_eval(ts)
-    wandb.log({"episode_return": score}, args.total_timesteps)
+    final_info = jit_eval(ts)
+    wandb.log(final_info, args.total_timesteps)
     wandb.finish()
 
 

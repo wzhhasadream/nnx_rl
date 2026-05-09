@@ -39,7 +39,7 @@ class Args:
     actor_hidden_dim: Sequence[int] = (512, 512, 512)
     actor_ln: Literal[True, False] = True
     num_q: int = 2
-    num_head: int = 1
+    num_head: int = 100
 
 
     action_repeat: int = 2
@@ -179,6 +179,8 @@ def main():
         obs = next_obs
 
     envs.close()
+    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), train_state.make_policy(), args.eval_episode)
+    wandb.log(final_info, args.total_timesteps)
     wandb.finish()
 
 

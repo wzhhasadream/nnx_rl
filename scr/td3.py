@@ -181,6 +181,8 @@ def main():
         obs = next_obs
 
     envs.close()
+    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), train_state.make_policy(), args.eval_episode)
+    wandb.log(final_info, args.total_timesteps)
     wandb.finish()
 
 
