@@ -41,8 +41,11 @@ def _normalize_config(value: Any) -> Any:
     return _to_python_scalar(value)
 
 
-def _config_hash(config: Dict) -> str:
-    normalized = _normalize_config(config)
+def _config_hash(config: Dict, exclude_keys: tuple[str, ...] = ("seed",)) -> str:
+    config_for_hash = {
+        key: value for key, value in config.items() if str(key) not in exclude_keys
+    }
+    normalized = _normalize_config(config_for_hash)
     payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
 
@@ -69,15 +72,15 @@ class Run:
         self.config_hash = _config_hash(cfg)
 
         os.makedirs(dir, exist_ok=True)
-        self.run_dir = os.path.join(dir, project, self.name, f"cfg_{self.config_hash}")
+        run_parent_dir = os.path.join(dir, project, self.name, f"cfg_{self.config_hash}")
+
+        if self.seed is not None:
+            run_parent_dir = os.path.join(run_parent_dir, f"seed_{self.seed}")
+
+        self.run_dir = run_parent_dir
         os.makedirs(self.run_dir, exist_ok=True)
         global run_dir
         run_dir = self.run_dir
-
-        if self.seed is not None:
-            self.run_dir = os.path.join(self.run_dir, f"seed_{self.seed}")
-            run_dir = self.run_dir
-            os.makedirs(self.run_dir, exist_ok=True)
 
         self.metrics_jsonl_file = os.path.join(self.run_dir, "metrics.jsonl")
         self.metrics_file = os.path.join(self.run_dir, "metrics.csv")
