@@ -70,7 +70,7 @@ def main():
 
     action_dim = int(np.prod(np.asarray(envs.single_action_space.shape)))
     obs_dim = int(np.prod(np.asarray(envs.single_observation_space.shape)))
-    args.target_entropy = - action_dim / 2
+    args.target_entropy = - action_dim 
 
     wandb.init(project='sac', config=vars(args), name=f'{args.env_id}')
 
