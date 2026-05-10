@@ -40,7 +40,6 @@ class Args:
     num_q: int = 2
     num_head: int = 100
 
-
     action_repeat: int = 2
     normalize_observation: Literal[True, False] = True
     simba: Literal[True, False] = False
@@ -64,7 +63,6 @@ def main():
     env = [load_env(args.env_id, args.env_type, args.action_repeat, args.seed + i)
            for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(env, autoreset_mode='SameStep')
-    envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
     action_dim = int(np.prod(np.asarray(envs.single_action_space.shape)))
     obs_dim = int(np.prod(np.asarray(envs.single_observation_space.shape)))
 
@@ -72,23 +70,22 @@ def main():
 
     rngs = nnx.Rngs(args.seed)
     actor = TanhDetActor(
-        obs_dim, 
+        obs_dim,
         action_dim,
-        rngs.fork(), 
-        hidden_dim=args.actor_hidden_dim, 
-        action_high=envs.single_action_space.high, 
-        action_low=envs.single_action_space.low, 
+        rngs.fork(),
+        hidden_dim=args.actor_hidden_dim,
+        action_high=envs.single_action_space.high,
+        action_low=envs.single_action_space.low,
         simba_encoder=args.simba,
         layer_norm=args.actor_ln)
 
     critic = EnsembleCritic(
-        obs_dim, 
-        action_dim, 
-        rngs.fork(split=args.num_q), 
+        obs_dim,
+        action_dim,
+        rngs.fork(split=args.num_q),
         hidden_dim=args.critic_hidden_dim,
         simba_encoder=args.simba,
         layer_norm=args.critic_ln)
-
 
     actor_opt = nnx.Optimizer(actor, optax.adam(args.policy_lr))
     critic_opt = nnx.Optimizer(critic, optax.adam(args.q_lr))
@@ -120,7 +117,8 @@ def main():
         else:
             obs_for_policy = obs
         actions = actor.get_action(obs_for_policy)
-        noise = jax.random.normal(key, shape=actions.shape) * actor.action_scale * args.exploration_noise
+        noise = jax.random.normal(
+            key, shape=actions.shape) * actor.action_scale * args.exploration_noise
         actions = jnp.clip(
             noise + actions, envs.single_action_space.low,  envs.single_action_space.high)
         return rms, actions
@@ -144,20 +142,6 @@ def main():
         next_obs, rewards, terminations, truncations, infos = envs.step(
             actions)
 
-        if terminations.any() or truncations.any():
-            done = np.logical_or(terminations, truncations)
-
-            episode_return = infos["episode"]['r'][done].mean()
-            episode_length = infos["episode"]['l'][done].mean()
-            current_time = time.time()
-            total_time = current_time - start_time
-
-            wandb.log({
-                "episode_return": episode_return,
-                "episode_length": episode_length,
-                "wall_time": total_time
-            }, global_step)
-
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc:
@@ -172,20 +156,23 @@ def main():
         )
 
         if global_step >= args.learning_starts:
-            big_batch = rb.sample(args.batch_size * args.grad_step_per_env_step)
+            big_batch = rb.sample(
+                args.batch_size * args.grad_step_per_env_step)
             train_state, info = jit_update(
                 train_state, big_batch, jax.random.fold_in(
                     update_key, global_step)
             )
             if global_step % args.eval_frequency == 0:
-                policy = lambda obs: train_state.get_action(obs)
-                eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
+                def policy(obs): return train_state.get_action(obs)
+                eval_info = evaluate_policy(load_env(
+                    args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
                 wandb.log({**info, **eval_info}, global_step)
         obs = next_obs
 
     envs.close()
-    policy = lambda obs: train_state.get_action(obs)
-    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
+    def policy(obs): return train_state.get_action(obs)
+    final_info = evaluate_policy(load_env(
+        args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
     wandb.log(final_info, args.total_timesteps)
     wandb.finish()
 

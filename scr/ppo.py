@@ -63,7 +63,6 @@ def main():
     env = [load_env(args.env_id, args.env_type, args.action_repeat, args.seed + i, True)
            for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(env)
-    envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
     if args.normalize_observation:
         envs = gym.wrappers.vector.NormalizeObservation(envs)
 
@@ -156,19 +155,7 @@ def main():
                 actions)
             next_dones = next_terminations | next_truncations
             global_step += actions.shape[0]
-
-            if next_dones.any():
-                episode_return = infos["episode"]['r'][next_dones].mean()
-                episode_length = infos["episode"]['l'][next_dones].mean()
-                current_time = time.time()
-                total_time = current_time - start_time
-
-
-                wandb.log({
-                    "training/episode_return": episode_return,
-                    "training/episode_length": episode_length,
-                    "training/wall_time": total_time
-                }, global_step)           
+      
 
             # Store rewards and dones
             rewards_list.append(rewards)
@@ -223,7 +210,8 @@ def main():
         rms = None
     policy = lambda obs: ts.get_action(obs)
     final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode, rms=rms)
-    wandb.log(final_info, args.total_timesteps)
+    wall_time = time.time() - start_time
+    wandb.log({**final_info, 'eval/wall_time':wall_time}, args.total_timesteps)
     wandb.finish()
     envs.close()
 

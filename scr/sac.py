@@ -69,7 +69,6 @@ def main():
                     args.seed + i) for i in range(args.num_envs)]
 
     envs = gym.vector.SyncVectorEnv(env, autoreset_mode='SameStep')
-    envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
 
     action_dim = int(np.prod(np.asarray(envs.single_action_space.shape)))
     obs_dim = int(np.prod(np.asarray(envs.single_observation_space.shape)))
@@ -152,20 +151,7 @@ def main():
 
         next_obs, rewards, terminations, truncations, infos = envs.step(
             actions)
-
-        if terminations.any() or truncations.any():
-            done = np.logical_or(terminations, truncations)
-
-            episode_return = infos["episode"]['r'][done].mean()
-            episode_length = infos["episode"]['l'][done].mean()
-            current_time = time.time()
-            total_time = current_time - start_time
-
-            wandb.log({
-                "training/episode_return": episode_return,
-                "training/episode_length": episode_length,
-                "training/wall_time": total_time
-            }, global_step)
+   
 
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
@@ -189,14 +175,16 @@ def main():
             )
             if global_step % args.eval_frequency == 0:
                 policy =  lambda obs: train_state.get_action(obs)
+                wall_time = time.time() - start_time
                 eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
-                wandb.log({**info, **eval_info}, global_step)
+                wandb.log({**info, **eval_info, "eval/wall_time": wall_time}, global_step)
         obs = next_obs
 
     envs.close()
     policy = lambda obs: train_state.get_action(obs)
     final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
-    wandb.log(final_info, args.total_timesteps)
+    wall_time = time.time() - start_time
+    wandb.log({**final_info, "eval/wall_time": wall_time}, args.total_timesteps)
     wandb.finish()
 
 
