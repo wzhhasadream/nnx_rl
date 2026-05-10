@@ -126,7 +126,7 @@ class ReplayBuffer:
         linear_decay_steps: int = 0,
         min_weight: float = 0.1,
         num_buckets: int = 2000,
-        use_approximate_sampling: bool = False,
+        use_approximate_sampling: bool = True,
         optimize_memory_usage: bool = False
     ):
         self.buffer_size = max(max_size // n_envs, 1)

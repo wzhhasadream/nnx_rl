@@ -103,17 +103,15 @@ class TrainState:
 
         return self.replace(grad_updates=state_map["grad_updates"], rms=state_map["rms"])
 
-
-    def make_policy(self):
-        def policy(obs):
-            if self.rms is not None:
-                obs_for_policy, _ = self.rms.normalize(obs, update=False)
-            else:
-                obs_for_policy = obs
-            
-            actions = self.actor.get_mean_action(obs_for_policy)
-            return actions
-        return nnx.jit(policy)
+    @nnx.jit
+    def get_action(self, obs):
+        if self.rms is not None:
+            obs_for_policy, _ = self.rms.normalize(obs, update=False)
+        else:
+            obs_for_policy = obs
+        
+        actions = self.actor.get_mean_action(obs_for_policy)
+        return actions
 
 
 
@@ -316,7 +314,6 @@ def sample_and_update_sac(
     ts, info = update_sac(train_state, config, update_key, big_batch)
 
     return ts, info
-
 
 
 

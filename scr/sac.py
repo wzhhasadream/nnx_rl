@@ -2,7 +2,7 @@ import nnxrl.utils.logger as wandb
 from flax import nnx
 from typing import Literal, Sequence
 from nnxrl.agents.sac import update_sac, TrainState
-from nnxrl.model import EnsembleCritic, SquashedTanhGaussianActor, Alpha
+from nnxrl.model import EnsembleCritic, SquashedTanhGaussianActor, Alpha, CoupleFlowActor
 from nnxrl.env import load_env
 from nnxrl.utils import RMS, ReplayBuffer, evaluate_policy
 import time
@@ -50,6 +50,9 @@ class Args:
     eval_frequency: int = 1e4
     eval_episode: int = 100
 
+    decay_step: int = 0
+    copuled_flow: Literal[True, False] = False
+
 
 
 
@@ -75,7 +78,18 @@ def main():
     wandb.init(project='sac', config=vars(args), name=f'{args.env_id}')
 
     rngs = nnx.Rngs(args.seed)
-    actor = SquashedTanhGaussianActor(
+    if args.copuled_flow:
+        actor = CoupleFlowActor(
+        obs_dim, action_dim, rngs.fork(),
+        hidden_dim=args.actor_hidden_dim,
+        action_high=envs.single_action_space.high,
+        action_low=envs.single_action_space.low,
+        simba_encoder=args.simba,
+        layer_norm=args.actor_ln
+        )
+    
+    else:
+        actor = SquashedTanhGaussianActor(
         obs_dim, action_dim, rngs.fork(),
         hidden_dim=args.actor_hidden_dim,
         action_high=envs.single_action_space.high,
@@ -101,7 +115,8 @@ def main():
         envs.single_observation_space,
         envs.single_action_space,
         args.buffer_size,
-        n_envs=args.num_envs
+        n_envs=args.num_envs,
+        linear_decay_steps=args.decay_step
     )
 
     if args.normalize_observation:
@@ -173,13 +188,14 @@ def main():
                     update_key, global_step)
             )
             if global_step % args.eval_frequency == 0:
-                policy = train_state.make_policy()
+                policy =  lambda obs: train_state.get_action(obs)
                 eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
                 wandb.log({**info, **eval_info}, global_step)
         obs = next_obs
 
     envs.close()
-    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), train_state.make_policy(), args.eval_episode)
+    policy = lambda obs: train_state.get_action(obs)
+    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
     wandb.log(final_info, args.total_timesteps)
     wandb.finish()
 

@@ -49,6 +49,8 @@ class Args:
     eval_frequency: int = int(1e4)
     eval_episode: int = 100
 
+    decay_step: int = 0
+
 
 def main():
     print("🚀 td3 training")
@@ -96,6 +98,7 @@ def main():
         envs.single_action_space,
         args.buffer_size,
         n_envs=args.num_envs,
+        linear_decay_steps=args.decay_step
     )
     if args.normalize_observation:
         rms = RMS.create(envs.single_observation_space.shape)
@@ -175,13 +178,14 @@ def main():
                     update_key, global_step)
             )
             if global_step % args.eval_frequency == 0:
-                policy = train_state.make_policy()
+                policy = lambda obs: train_state.get_action(obs)
                 eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
                 wandb.log({**info, **eval_info}, global_step)
         obs = next_obs
 
     envs.close()
-    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), train_state.make_policy(), args.eval_episode)
+    policy = lambda obs: train_state.get_action(obs)
+    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
     wandb.log(final_info, args.total_timesteps)
     wandb.finish()
 

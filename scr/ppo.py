@@ -210,6 +210,7 @@ def main():
                 rms = envs.obs_rms
             else:
                 rms = None
+            policy = lambda obs: ts.get_action(obs)
             eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode, rms=rms)
             wandb.log({**info, **eval_info}, global_step)
 
@@ -220,7 +221,8 @@ def main():
         rms = envs.obs_rms
     else:
         rms = None
-    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), ts.make_policy(), args.eval_episode, rms=rms)
+    policy = lambda obs: ts.get_action(obs)
+    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode, rms=rms)
     wandb.log(final_info, args.total_timesteps)
     wandb.finish()
     envs.close()

@@ -104,7 +104,8 @@ def main():
     jit_rollout = nnx.jit(lambda ts, state, key: rollout(ts, env, state, key, args))
 
     def eval(ts):
-        return evaluate_playground_policy(env, ts.make_policy(), args.eval_episode, seed=args.seed + 1)
+        policy = lambda obs: ts.get_action(obs)
+        return evaluate_playground_policy(env, policy, args.eval_episode, seed=args.seed + 1)
 
     jit_eval = nnx.jit(eval)
 

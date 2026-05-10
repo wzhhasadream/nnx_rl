@@ -7,7 +7,6 @@ from .layer import SimBaEncoder
 from .network import MLP
 from .policy import squash_tanh_action, squash_log_std_tanh
 
-
 def encode_low_to_high_batch(x: jax.Array, perm: jax.Array, dim: int) -> jax.Array:
     """Batch version: x shape (B, m), output z shape (B, dim)."""
     x = jnp.asarray(x)
@@ -208,9 +207,14 @@ class CoupleFlowActor(nnx.Module):
             logdet = logdet + step_logdet
         return x, logdet
 
-    def sample_and_log_prob(self, obs: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
-        x_0 = jax.random.normal(
-            key, (obs.shape[0], self.action_dim), dtype=jnp.float32)
+    def sample_and_log_prob(self, obs: jax.Array, *, key: jax.Array | None = None, noise: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
+        if noise is not None:
+            x_0 = noise
+        elif key is not None:
+            x_0 = jax.random.normal(
+                key, (obs.shape[0], self.action_dim), dtype=jnp.float32)
+        else:
+            raise ValueError("Either key or noise must be provided.")
         z_0 = x_0
         if hasattr(self, 'perm'):
             z_0 = encode_low_to_high_batch(x_0, self.perm, self.latent_dim)
@@ -224,5 +228,10 @@ class CoupleFlowActor(nnx.Module):
         return action, log_prob
 
     def get_action(self, obs: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
-        action, log_prob = self.sample_and_log_prob(obs, key)
+        action, log_prob = self.sample_and_log_prob(obs, key=key)
         return action, log_prob[:, None]
+
+
+    def get_mean_action(self, obs: jax.Array):
+        noise = jnp.zeros((obs.shape[0], self.action_dim), dtype=jnp.float32)
+        return self.sample_and_log_prob(obs, noise=noise)[0]
