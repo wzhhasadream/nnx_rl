@@ -63,11 +63,12 @@ def main():
     env = [load_env(args.env_id, args.env_type, args.action_repeat, args.seed + i, True)
            for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(env)
-    if args.normalize_observation:
-        envs = gym.wrappers.vector.NormalizeObservation(envs)
 
     if args.normalize_reward:
         envs = gym.wrappers.vector.NormalizeReward(envs, args.gamma)
+
+    if args.normalize_observation:
+        envs = gym.wrappers.vector.NormalizeObservation(envs)
     
     def lr_schedule(step):
         progress = (step // steps_per_rollout) / max(num_rollout, 1)
@@ -192,7 +193,6 @@ def main():
         
         ts, info = jit_update(ts, traj, jax.random.fold_in(update_key, rollout_idx))
         if rollout_idx % args.eval_frequency == 0:
-            policy = ts.make_policy()
             if args.normalize_observation:
                 rms = envs.obs_rms
             else:
