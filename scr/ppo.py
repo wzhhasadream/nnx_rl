@@ -46,7 +46,7 @@ class Args:
     critic_ln: Literal[True, False] = False
     simba: Literal[True, False] = False
     action_repeat: int = 1
-    eval_episode: int = 100
+    eval_episode: int = 10
     eval_frequency: int = 20
 
 

@@ -46,7 +46,7 @@ class Args:
     grad_step_per_env_step: int = 1
 
     eval_frequency: int = int(1e4)
-    eval_episode: int = 100
+    eval_episode: int = 10
 
     decay_step: int = 0
 
@@ -165,15 +165,15 @@ def main():
             if global_step % args.eval_frequency == 0:
                 def policy(obs): return train_state.get_action(obs)
                 eval_info = evaluate_policy(load_env(
-                    args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
-                wandb.log({**info, **eval_info}, global_step)
+                    args.env_id, args.env_type, args.action_repeat, args.seed + 100), policy, args.eval_episode)
+                wandb.log({**info, **eval_info, "eval/wall_time": time.time() - start_time}, global_step)
         obs = next_obs
 
     envs.close()
     def policy(obs): return train_state.get_action(obs)
     final_info = evaluate_policy(load_env(
-        args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
-    wandb.log(final_info, args.total_timesteps)
+        args.env_id, args.env_type, args.action_repeat, args.seed + 100), policy, args.eval_episode)
+    wandb.log({**final_info, "eval/wall_time": time.time() - start_time}, args.total_timesteps)
     wandb.finish()
 
 

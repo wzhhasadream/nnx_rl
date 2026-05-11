@@ -11,9 +11,9 @@ def evaluate_policy(
     rms: RunningMeanStd | None = None
 ) -> dict:
     if isinstance(env_creater, list):
-        envs = gymnasium.vector.AsyncVectorEnv(env_creater)
+        envs = gymnasium.vector.SyncVectorEnv(env_creater)
     else:
-        envs = gymnasium.vector.AsyncVectorEnv([env_creater] * num_envs)
+        envs = gymnasium.vector.SyncVectorEnv([env_creater] * num_envs)
     envs = gymnasium.wrappers.vector.RecordEpisodeStatistics(envs)
     if rms is not None:
         import copy

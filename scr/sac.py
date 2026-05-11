@@ -48,7 +48,7 @@ class Args:
     grad_step_per_env_step: int = 1
 
     eval_frequency: int = 1e4
-    eval_episode: int = 100
+    eval_episode: int = 10
 
     decay_step: int = 0
     copuled_flow: Literal[True, False] = False
@@ -176,13 +176,13 @@ def main():
             if global_step % args.eval_frequency == 0:
                 policy =  lambda obs: train_state.get_action(obs)
                 wall_time = time.time() - start_time
-                eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
+                eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100), policy, args.eval_episode)
                 wandb.log({**info, **eval_info, "eval/wall_time": wall_time}, global_step)
         obs = next_obs
 
     envs.close()
     policy = lambda obs: train_state.get_action(obs)
-    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode)
+    final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100), policy, args.eval_episode)
     wall_time = time.time() - start_time
     wandb.log({**final_info, "eval/wall_time": wall_time}, args.total_timesteps)
     wandb.finish()
