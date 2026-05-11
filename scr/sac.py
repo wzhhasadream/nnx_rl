@@ -51,7 +51,7 @@ class Args:
     eval_episode: int = 10
 
     decay_step: int = 0
-    copuled_flow: Literal[True, False] = False
+    coupled_flow: Literal[True, False] = False
 
 
 
@@ -77,7 +77,7 @@ def main():
     wandb.init(project='sac', config=vars(args), name=f'{args.env_id}')
 
     rngs = nnx.Rngs(args.seed)
-    if args.copuled_flow:
+    if args.coupled_flow:
         actor = CoupleFlowActor(
         obs_dim, action_dim, rngs.fork(),
         hidden_dim=args.actor_hidden_dim,
