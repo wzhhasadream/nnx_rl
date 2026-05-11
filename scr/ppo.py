@@ -198,8 +198,9 @@ def main():
             else:
                 rms = None
             policy = lambda obs: ts.get_action(obs)
+            wall_time = time.time() - start_time
             eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100, True), policy, args.eval_episode, rms=rms)
-            wandb.log({**info, **eval_info}, global_step)
+            wandb.log({**info, **eval_info, 'eval/wall_time':wall_time}, global_step)
 
         obs = next_obs
         dones = next_dones
