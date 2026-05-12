@@ -6,7 +6,10 @@ GaussianActor,
 soft_update, 
 Alpha, 
 SquashedAlpha,
-EnsembleCritic
+EnsembleCritic,
+ActorCritic,
+FlowActor,
+freeze_module_params
 )
 
 from .quantile_loss import quantile_loss

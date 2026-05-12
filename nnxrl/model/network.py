@@ -13,15 +13,37 @@ from .policy import (
     squash_log_std_tanh,
 )
 
+
+def soft_update(online: nnx.Module, target_net: nnx.Module, tau: float = 0.005) -> None:
+    """Soft-update network parameters."""
+    online_params = nnx.state(online, nnx.Param)
+    target_params = nnx.state(target_net, nnx.Param)
+    new_params = jax.tree.map(
+        lambda online_p, target_p: tau *
+        online_p + (1 - tau) * target_p,
+        online_params,
+        target_params,
+    )
+    nnx.update(target_net, new_params)
+
+
+def freeze_module_params(module):
+    graphdef, params, rest = nnx.split(module, nnx.Param, ...)
+    frozen_params = jax.tree.map(jax.lax.stop_gradient, params)
+    return nnx.merge(graphdef, frozen_params, rest)
+
+
+
+
 class QNetwork(nnx.Module):
     def __init__(self, obs_dim: int | tuple[int, ...],
-                action_dim: int,
-                rngs: nnx.Rngs,
-                hidden_dim=(256, 256),
-                activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
-                layer_norm: bool = False,
-                simba_encoder: bool = False,
-                num_head: int = 1     # for distributional q
+                 action_dim: int,
+                 rngs: nnx.Rngs,
+                 hidden_dim=(256, 256),
+                 activation_fn: Callable[[jax.Array], jax.Array] = jax.nn.mish,
+                 layer_norm: bool = False,
+                 simba_encoder: bool = False,
+                 num_head: int = 1     # for distributional q
                  ):
         self.obs_dim = flattened_dim(obs_dim)
         if simba_encoder:
@@ -67,7 +89,6 @@ class VNetwork(nnx.Module):
         return self.out(h)
 
 
-
 class EnsembleCritic(nnx.Module):
     """Ensemble Q network using NNX API."""
     @nnx.vmap(in_axes=(0, None, None, 0, None, None, None, None, None))
@@ -93,18 +114,6 @@ class EnsembleCritic(nnx.Module):
 
 
 
-
-def soft_update(online: nnx.Module, target_net: nnx.Module, tau: float = 0.005) -> None:
-    """Soft-update network parameters."""
-    online_params = nnx.state(online, nnx.Param)
-    target_params = nnx.state(target_net, nnx.Param)
-    new_params = jax.tree.map(
-        lambda online_p, target_p: tau *
-        online_p + (1 - tau) * target_p,
-        online_params,
-        target_params,
-    )
-    nnx.update(target_net, new_params)
 
 
 class TanhDetActor(nnx.Module):
@@ -145,7 +154,6 @@ class TanhDetActor(nnx.Module):
         """
         pre_tanh = self.actor_head(self.encoder(x))
         return self.policy.action(pre_tanh)
-
 
 
 class SquashedTanhGaussianActor(nnx.Module):
@@ -246,7 +254,7 @@ class GaussianActor(nnx.Module):
             out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
         if not self.shared_std:
             self.fc_logstd = nnx.Linear(
-            out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
+                out_dim, action_dim, rngs=rngs, kernel_init=orthogonal())
         else:
             self.log_std = nnx.Param(jnp.zeros((action_dim, )))
 
@@ -305,7 +313,8 @@ class FlowActor(nnx.Module):
 
         self.obs_dim = flattened_dim(obs_dim)
         if simba_encoder:
-            self.encoder = SimBaEncoder(self.obs_dim + self.action_dim + emb_dim, 128, 1, rngs)
+            self.encoder = SimBaEncoder(
+                self.obs_dim + self.action_dim + emb_dim, 128, 1, rngs)
             out_dim = 128
         else:
             self.encoder = MLP(self.obs_dim + self.action_dim + emb_dim, hidden_dim, rngs, layer_norm,
@@ -321,10 +330,14 @@ class FlowActor(nnx.Module):
         x = self.encoder(inputs)
         return self.head(x)
 
-
-    def get_action(self, x: jax.Array, key: jax.Array) -> jax.Array:
+    def get_action(self, x: jax.Array, *,  key: jax.Array | None = None, noise: jax.Array | None = None) -> jax.Array:
         batch_size = x.shape[0]
-        a_i = jax.random.normal(key, shape=(batch_size, self.action_dim))
+        if key is not None:
+            a_i = jax.random.normal(key, shape=(batch_size, self.action_dim))
+        elif noise is not None:
+            a_i = noise
+        else:
+            raise KeyError("key or noise must be provided")
 
         for i in range(self.euler_steps):
             t = jnp.full((batch_size, 1), (i + 0.5) / self.euler_steps)
@@ -335,6 +348,16 @@ class FlowActor(nnx.Module):
 
         return actions
 
+    def get_mean_action(self, obs):
+        noise = jnp.zeros((obs.shape[0], self.action_dim), dtype=jnp.float32)
+
+        return self.get_action(obs, noise=noise)
+
+
+class ActorCritic(nnx.Module):
+    def __init__(self, actor, critic):
+        self.actor = actor
+        self.critic = critic
 
 
 class Alpha(nnx.Module):
@@ -345,7 +368,6 @@ class Alpha(nnx.Module):
         return jnp.exp(self.log_alpha.value)
 
 
-
 class SquashedAlpha(nnx.Module):
     def __init__(self, init_value: float = 0.0, log_std_min: float = -10.0, log_std_max: float = 7.5):
         self.log_alpha = nnx.Param(jnp.asarray(init_value))
@@ -354,5 +376,6 @@ class SquashedAlpha(nnx.Module):
 
     def __call__(self) -> jax.Array:
         log_alpha = self.log_alpha.value
-        log_alpha = squash_log_std_tanh(log_alpha, log_std_min=self.log_std_min, log_std_max=self.log_std_max)
+        log_alpha = squash_log_std_tanh(
+            log_alpha, log_std_min=self.log_std_min, log_std_max=self.log_std_max)
         return jnp.exp(log_alpha)

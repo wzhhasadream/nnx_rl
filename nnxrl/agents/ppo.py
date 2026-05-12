@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx, struct
 from typing import NamedTuple, Protocol
-from ..model import VNetwork, GaussianActor
+from ..model import VNetwork, GaussianActor, ActorCritic
 from ..utils import save_states, load_states, RMS
 
 class PPOConfig(Protocol):
@@ -34,10 +34,6 @@ class PPOConfig(Protocol):
 
 
 
-class ActorCritic(nnx.Module):
-    def __init__(self, actor: GaussianActor, critic: VNetwork):
-        self.actor = actor
-        self.critic = critic
 
 
 
