@@ -1,7 +1,7 @@
 
 import jax.numpy as jnp
 from nnxrl.agents.ppo import ActorCritic, TrainState, update_ppo, Trajectory
-from nnxrl.utils import evaluate_policy, RMS
+from nnxrl.utils import evaluate_policy
 from flax import nnx
 import jax
 from nnxrl.env import load_env
