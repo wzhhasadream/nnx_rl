@@ -1,77 +1,45 @@
-from collections.abc import Mapping
-
-from flax import nnx, serialization
-from .normalization import RMS
-
-
-def _serialize_value(value):
-    if value is None:
-        return {"kind": "none", "data": None}
-    if isinstance(value, int):
-        return {"kind": "int", "data": value}
-    if isinstance(value, RMS):
-        state = nnx.state(value)
-        return {
-            "kind": "rms_state",
-            "data": nnx.to_pure_dict(state),
-            "epsilon": value.epsilon,
-        }
-    try:
-        return {
-            "kind": "nnx_state",
-            "data": nnx.to_pure_dict(nnx.state(value)),
-        }
-    except Exception:
-        return {"kind": "raw", "data": value}
+from pathlib import Path
+import jax
+from flax import nnx
+import orbax.checkpoint as ocp
 
 
-def _restore_value(template, payload):
-    kind = payload["kind"]
-    if kind in ("none", "int", "raw"):
-        return payload["data"]
-
-    if kind == "rms_state":
-        state = nnx.State(payload["data"])
-        if template is None:
-            return RMS(
-                mean=state["mean"],
-                var=state["var"],
-                count=state["count"],
-                epsilon=payload["epsilon"],
-            )
-        return template.replace(**dict(state))
-
-    if kind == "nnx_state":
-        state = nnx.State(payload["data"])
-        if template is None:
-            return state
-        nnx.update(template, state)
-        return template
-
-    raise ValueError(f"Unsupported checkpoint payload kind: {kind}")
+def _to_state_tree(tree):
+    return jax.tree.map(
+        lambda x: nnx.state(x) if isinstance(x, nnx.Object) else x,
+        tree,
+        is_leaf=lambda x: isinstance(x, nnx.Object),
+    )
 
 
-def save_states(path: str, state_map: Mapping[str, object]) -> None:
-    payload = {key: _serialize_value(value) for key, value in state_map.items()}
+def _merge_from_template(template_tree, state_tree):
+    return jax.tree.map(
+        lambda obj, st: nnx.merge(nnx.graphdef(obj), st)
+        if isinstance(obj, nnx.Object) else st,
+        template_tree,
+        state_tree,
+        is_leaf=lambda x: isinstance(x, nnx.Object),
+    )
 
-    with open(path, "wb") as f:
-        f.write(serialization.to_bytes(payload))
+
+def save_states(path: str, state_dict: dict[str, object]) -> None:
+    path = Path(path).resolve()
+    state_tree = _to_state_tree(state_dict)
+
+    with ocp.StandardCheckpointer() as ckpt:
+        ckpt.save(path, state_tree)
+        ckpt.wait_until_finished()
 
 
 def load_states(
     path: str,
-    template_map: Mapping[str, object]
+    model_dict: dict[str, object],
 ) -> dict[str, object]:
-    template = {key: _serialize_value(value) for key, value in template_map.items()}
+    path = Path(path).resolve()
+    abstract_state_tree = _to_state_tree(model_dict)
 
-    with open(path, "rb") as f:
-        state_map = serialization.from_bytes(template, f.read())
+    with ocp.StandardCheckpointer() as ckpt:
+        restored_state_tree = ckpt.restore(path, abstract_state_tree)
 
-
-    restored = {
-        key: _restore_value(template_map[key], state_map.get(key))
-        for key in template_map
-    }
-
-    return restored
+    return _merge_from_template(model_dict, restored_state_tree)
 

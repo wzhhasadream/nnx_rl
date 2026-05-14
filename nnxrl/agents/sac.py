@@ -89,7 +89,7 @@ class TrainState:
         })
 
     def load(self, path: str):
-        state_map = load_states(path, {
+        model_dict = load_states(path, {
             "actor": self.actor,
             "critic": self.critic,
             "actor_opt": self.actor_opt,
@@ -101,7 +101,7 @@ class TrainState:
             "grad_updates": self.grad_updates
         })
 
-        return self.replace(grad_updates=state_map["grad_updates"], rms=state_map["rms"])
+        return self.replace(**model_dict)
 
     @nnx.jit
     def get_action(self, obs):

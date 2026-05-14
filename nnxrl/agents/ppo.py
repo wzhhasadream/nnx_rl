@@ -58,12 +58,12 @@ class TrainState:
             "rms": self.rms
         })
     def load(self, path: str):
-        state = load_states(path, {
+        model_dict = load_states(path, {
             "agent": self.agent,
             "opt": self.opt,
             "rms": self.rms
         })
-        return self.replace(rms=state["rms"])
+        return self.replace(**model_dict)
 
     @nnx.jit
     def get_action(self, obs):
