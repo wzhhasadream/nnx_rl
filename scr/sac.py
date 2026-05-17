@@ -131,7 +131,7 @@ def main():
         ts, args, key, big_batch), donate_argnums=0)
     obs, _ = envs.reset(seed=args.seed)
     action_key, update_key = jax.random.split(jax.random.PRNGKey(args.seed))
-    
+
     for global_step in range(1, args.total_timesteps + 1):
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample()
@@ -160,19 +160,19 @@ def main():
         if global_step >= args.learning_starts:
             big_batch = rb.sample(
                 args.batch_size * args.grad_step_per_env_step)
-            train_state, info = jit_update(
-                train_state, big_batch, jax.random.fold_in(
+            ts, info = jit_update(
+                ts, big_batch, jax.random.fold_in(
                     update_key, global_step)
             )
             if global_step % args.eval_frequency == 0:
-                policy =  lambda obs: train_state.get_action(obs)
+                policy =  lambda obs: ts.get_action(obs)
                 wall_time = time.time() - start_time
                 eval_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100), policy, args.eval_episode)
                 wandb.log({**info, **eval_info, "eval/wall_time": wall_time}, global_step)
         obs = next_obs
 
     envs.close()
-    policy = lambda obs: train_state.get_action(obs)
+    policy = lambda obs: ts.get_action(obs)
     final_info = evaluate_policy(load_env(args.env_id, args.env_type, args.action_repeat, args.seed + 100), policy, args.eval_episode)
     wall_time = time.time() - start_time
     wandb.log({**final_info, "eval/wall_time": wall_time}, args.total_timesteps)
