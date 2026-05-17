@@ -116,7 +116,7 @@ class TrainState:
     @nnx.jit
     def get_exploration_action(self, obs: jax.Array, key: jax.Array):
         if self.rms is not None:
-            obs_for_policy, rms = self.rms.normalize(obs, rms)
+            obs_for_policy, rms = self.rms.normalize(obs)
         else:
             obs_for_policy = obs
             rms = None
