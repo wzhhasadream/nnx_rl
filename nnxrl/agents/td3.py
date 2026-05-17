@@ -93,7 +93,7 @@ class TrainState:
         return self.replace(**model_dict)
 
     @nnx.jit
-    def get_action(self, obs):
+    def get_action(self, obs: jax.Array):
         if self.rms is not None:
             obs_for_policy, _ = self.rms.normalize(obs, update=False)
         else:
@@ -102,7 +102,19 @@ class TrainState:
         actions = self.actor.get_action(obs_for_policy)
         return actions
 
-
+    @nnx.jit
+    def get_exploration_action(self, obs: jax.Array, exploration_noise: float, key: jax.Array):
+        if self.rms is not None:
+            obs_for_policy, rms = self.rms.normalize(obs, update=True)
+        else:
+            obs_for_policy = obs
+            rms = None
+        actions = self.actor.get_action(obs_for_policy)
+        noise = jax.random.normal(
+            key, shape=actions.shape) * self.actor.action_scale * exploration_noise
+        actions = jnp.clip(
+            noise + actions, self.actor.action_low,  self.actor.action_high)
+        return self.replace(rms=rms), actions
 
 
 

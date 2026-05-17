@@ -106,9 +106,9 @@ def main():
         num_head=args.num_head
     )
     alpha = Alpha() if args.autotune else None
-    actor_opt = nnx.Optimizer(actor, optax.adam(args.policy_lr))
-    critic_opt = nnx.Optimizer(critic, optax.adam(args.q_lr))
-    alpha_opt = nnx.Optimizer(alpha, optax.adam(args.policy_lr)) if args.autotune else None
+    actor_opt = nnx.Optimizer(actor, optax.adamw(args.policy_lr, weight_decay=1e-2))
+    critic_opt = nnx.Optimizer(critic, optax.adamw(args.q_lr, weight_decay=1e-2))
+    alpha_opt = nnx.Optimizer(alpha, optax.adamw(args.policy_lr)) if args.autotune else None
 
     rb = ReplayBuffer(
         envs.single_observation_space,
@@ -123,30 +123,21 @@ def main():
     else:
         rms = None
 
-    train_state = TrainState.create(actor, critic, actor_opt, critic_opt, rms, alpha=alpha, alpha_opt=alpha_opt)
+    ts = TrainState.create(actor, critic, actor_opt, critic_opt, rms, alpha=alpha, alpha_opt=alpha_opt)
     start_time = time.time()
 
-    @nnx.jit
-    def get_action(actor, rms, obs, key):
-        if args.normalize_observation:
-            obs_for_policy, rms = rms.normalize(obs, rms)
-        else:
-            obs_for_policy = obs
-        actions, _ = actor.get_action(obs_for_policy, key=key)
-        return rms, actions
 
     jit_update = nnx.jit(lambda ts, big_batch, key: update_sac(
         ts, args, key, big_batch), donate_argnums=0)
     obs, _ = envs.reset(seed=args.seed)
     action_key, update_key = jax.random.split(jax.random.PRNGKey(args.seed))
+    
     for global_step in range(1, args.total_timesteps + 1):
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample()
                                for _ in range(args.num_envs)])
         else:
-            rms, actions = get_action(
-                train_state.actor, train_state.rms, obs, jax.random.fold_in(action_key, global_step))
-            train_state = train_state.replace(rms=rms)
+            ts, actions = ts.get_exploration_action(obs=obs, key=jax.random.fold_in(action_key, global_step))
             actions = np.asarray(actions)
 
         next_obs, rewards, terminations, truncations, infos = envs.step(

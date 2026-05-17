@@ -87,8 +87,8 @@ def main():
         simba_encoder=args.simba,
         layer_norm=args.critic_ln)
 
-    actor_opt = nnx.Optimizer(actor, optax.adam(args.policy_lr))
-    critic_opt = nnx.Optimizer(critic, optax.adam(args.q_lr))
+    actor_opt = nnx.Optimizer(actor, optax.adamw(args.policy_lr, weight_decay=1e-2))
+    critic_opt = nnx.Optimizer(critic, optax.adamw(args.q_lr, weight_decay=1e-2))
 
     rb = ReplayBuffer(
         envs.single_observation_space,
@@ -101,7 +101,8 @@ def main():
         rms = RMS.create(envs.single_observation_space.shape)
     else:
         rms = None
-    train_state = TrainState.create(
+
+    ts = TrainState.create(
         actor=actor,
         critic=critic,
         actor_opt=actor_opt,
@@ -110,18 +111,6 @@ def main():
     )
     start_time = time.time()
 
-    @nnx.jit
-    def get_action_with_exploration_noise(actor, rms, obs, key):
-        if args.normalize_observation:
-            obs_for_policy, rms = rms.normalize(obs, update=True)
-        else:
-            obs_for_policy = obs
-        actions = actor.get_action(obs_for_policy)
-        noise = jax.random.normal(
-            key, shape=actions.shape) * actor.action_scale * args.exploration_noise
-        actions = jnp.clip(
-            noise + actions, envs.single_action_space.low,  envs.single_action_space.high)
-        return rms, actions
 
     jit_update = nnx.jit(lambda ts, big_batch, key: update_td3(
         ts, args, key, big_batch), donate_argnums=0)
@@ -134,9 +123,7 @@ def main():
             actions = np.array([envs.single_action_space.sample()
                                for _ in range(args.num_envs)])
         else:
-            rms, actions = get_action_with_exploration_noise(
-                train_state.actor, train_state.rms, obs, jax.random.fold_in(step_key, global_step))
-            train_state = train_state.replace(rms=rms)
+            ts, actions = ts.get_exploration_action(obs, args.exploration_noise, jax.random.fold_in(step_key, global_step))
             actions = np.asarray(actions)
 
         next_obs, rewards, terminations, truncations, infos = envs.step(
