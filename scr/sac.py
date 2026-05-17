@@ -52,6 +52,8 @@ class Args:
 
     decay_step: int = 0
     coupled_flow: Literal[True, False] = False
+    num_step: int = 5
+    num_ode: int = 3
 
 
 
@@ -84,7 +86,9 @@ def main():
         action_high=envs.single_action_space.high,
         action_low=envs.single_action_space.low,
         simba_encoder=args.simba,
-        layer_norm=args.actor_ln
+        layer_norm=args.actor_ln,
+        num_ode=args.num_ode,
+        num_steps=args.num_step
         )
     
     else:
