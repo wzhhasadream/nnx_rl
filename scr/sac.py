@@ -110,9 +110,9 @@ def main():
         num_head=args.num_head
     )
     alpha = Alpha() if args.autotune else None
-    actor_opt = nnx.Optimizer(actor, optax.adamw(args.policy_lr, weight_decay=1e-2))
-    critic_opt = nnx.Optimizer(critic, optax.adamw(args.q_lr, weight_decay=1e-2))
-    alpha_opt = nnx.Optimizer(alpha, optax.adamw(args.policy_lr)) if args.autotune else None
+    actor_opt = nnx.Optimizer(actor, optax.adam(args.policy_lr))
+    critic_opt = nnx.Optimizer(critic, optax.adam(args.q_lr))
+    alpha_opt = nnx.Optimizer(alpha, optax.adam(args.policy_lr)) if args.autotune else None
 
     rb = ReplayBuffer(
         envs.single_observation_space,
